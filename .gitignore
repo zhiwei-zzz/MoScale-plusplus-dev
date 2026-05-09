@@ -172,3 +172,9 @@ edit_result/
 visualization/data
 
 .ipynb_checkpoints/
+# Project-specific ignores (SkelVQ extensions)
+training_logs/
+log/
+checkpoints/
+archive_*/
+dataset/humanml3d
