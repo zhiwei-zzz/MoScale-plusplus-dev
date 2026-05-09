@@ -87,6 +87,18 @@ def arg_parse(is_train=False):
     parser.add_argument("--save_latest", default=500, type=int)
     parser.add_argument("--eval_every_e", default=1, type=int)
 
+    # wandb (optional; mirrors TensorBoard scalars when enabled)
+    parser.add_argument("--use_wandb", action="store_true",
+                        help="enable wandb logging in addition to TensorBoard")
+    parser.add_argument("--wandb_project", type=str, default="moscale-plusplus",
+                        help="wandb project name")
+    parser.add_argument("--wandb_entity", type=str, default="zhiwei-z-org",
+                        help="wandb entity (org or user)")
+    parser.add_argument("--wandb_team", type=str, default="zhiwei-z",
+                        help="wandb team tag (added to run tags)")
+    parser.add_argument("--wandb_run_name", type=str, default="",
+                        help="wandb run display name (defaults to --name)")
+
     opt = parser.parse_args()
     torch.cuda.set_device(opt.gpu_id)
     opt.device = torch.device("cpu" if opt.gpu_id == -1 else "cuda:" + str(opt.gpu_id))

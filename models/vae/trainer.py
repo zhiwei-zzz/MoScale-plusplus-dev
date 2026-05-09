@@ -1,5 +1,4 @@
 import torch
-from torch.utils.tensorboard import SummaryWriter
 from os.path import join as pjoin
 
 import os
@@ -9,6 +8,7 @@ from collections import OrderedDict, defaultdict
 
 from utils.eval_t2m import evaluation_vae, test_vae
 from utils.utils import print_current_loss
+from models.vae.wandb_helper import make_logger
 
 def def_value():
     return 0.0
@@ -19,7 +19,7 @@ class VAETrainer:
         self.vae = vae
 
         if opt.is_train:
-            self.logger = SummaryWriter(opt.log_dir)
+            self.logger = make_logger(opt)
             if opt.recon_loss == "l1":
                 self.recon_criterion = torch.nn.L1Loss()
             elif opt.recon_loss == "l1_smooth":
