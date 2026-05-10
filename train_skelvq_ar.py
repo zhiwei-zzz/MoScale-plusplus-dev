@@ -29,9 +29,12 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-from data.t2m_dataset import MotionDataset, Text2MotionDatasetEval, collate_fn as eval_collate
+from data.t2m_dataset import (
+    MotionDataset, Text2MotionDataset, Text2MotionDatasetEval,
+    collate_fn as eval_collate,
+)
 from data.t2m_caption_dataset import (
-    Text2MotionWindowDataset, Text2MotionPaddedDataset,
+    Text2MotionWindowDataset,
     collate_fn as caption_collate,
 )
 from utils.get_opt import get_opt
@@ -87,8 +90,13 @@ def build_dataset(opt):
     val_split = pjoin(opt.data_root, "val.txt")
     if opt.text_cond:
         if getattr(opt, "variable_length", True):
-            train_ds = Text2MotionPaddedDataset(opt, mean, std, train_split)
-            val_ds = Text2MotionPaddedDataset(opt, mean, std, val_split)
+            # SALAD's stage-2 (denoiser) training data class. Variable-length up
+            # to opt.max_motion_length, zero-padded, with the "single/double"
+            # unit_length coin flip for mild length randomization. Returns
+            # (caption, padded_motion, m_length) — same shape our caption_collate
+            # already handles.
+            train_ds = Text2MotionDataset(opt, mean, std, train_split)
+            val_ds = Text2MotionDataset(opt, mean, std, val_split)
         else:
             train_ds = Text2MotionWindowDataset(opt, mean, std, train_split)
             val_ds = Text2MotionWindowDataset(opt, mean, std, val_split)
