@@ -9,11 +9,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 RUNS = [
-    ("vae_repro",  "Gaussian + KL",                       "continuous (~17000-22000 effective)",
+    # bits_per_clip is computed for T=64 (training distribution), L=112,
+    # residual cascade [8,4,2,1] -> per-scale cells [14,28,56,112] sum 210.
+    # BSQ:  210 cells * 32 channels * 1 bit = 6720
+    # FSQ:  210 cells * 32 channels * log2(7) ~= 18860  (7 effective levels)
+    ("vae_repro",  "Gaussian + KL",                  "continuous (~17000-22000 effective)",
      ROOT / "training_logs/vae_repro_finaleval.stdout"),
-    ("skelvq_bsq", "BSQ (1 bit/ch x 32 x 4 scales)",      "14336",
+    ("skelvq_bsq", "BSQ (1 bit x 32 ch x 4 scales)",  "6720",
      ROOT / "training_logs/skelvq_bsq_finaleval.stdout"),
-    ("skelvq_fsq", "FSQ L=8 (3 bits/ch x 32 x 4 scales)", "43008",
+    ("skelvq_fsq", "FSQ L=8 (log2(7) bit x 32 ch x 4 scales)", "18860",
      ROOT / "training_logs/skelvq_fsq_finaleval.stdout"),
 ]
 

@@ -38,9 +38,16 @@ window 64, latent_dim 32, n_layers 2.
 
 | Run | Bottleneck | bits/clip | FID ↓ | MPJPE ↓ | Diversity | TOP3 |
 |---|---|---|---|---|---|---|
-| `vae_repro` | continuous Gaussian + KL | (effective ~17-22k) | **0.003 ± 0.000** | 0.016 | 9.510 | 0.797 |
-| `skelvq_bsq` | BSQ (1 bit/channel × 32 × 4 scales) | 14,336 | 0.021 ± 0.000 | 0.029 | 9.432 | 0.796 |
-| `skelvq_fsq` | FSQ L=8 (3 bits/channel × 32 × 4 scales) | 43,008 | **0.007 ± 0.000** | 0.019 | 9.438 | 0.797 |
+| `vae_repro` | continuous Gaussian + KL | ~17–22k effective | **0.003 ± 0.000** | 0.016 | 9.510 | 0.797 |
+| `skelvq_bsq` | BSQ (1 bit × 32 ch, 4 residual scales) | 6,720 | 0.021 ± 0.000 | 0.029 | 9.432 | 0.796 |
+| `skelvq_fsq` | FSQ L=8 (log₂7 ≈ 2.81 bit × 32 ch, 4 residual scales) | ~18,860 | **0.007 ± 0.000** | 0.019 | 9.438 | 0.797 |
+
+Bit-budget arithmetic for the discrete bottlenecks (T=64 training clips):
+total cells across the residual cascade = sum over scales `[8, 4, 2, 1]` of
+`L // s` where `L = T/4 × J_b = 16 × 7 = 112`. Per-scale cell counts
+`[14, 28, 56, 112]` sum to **210 cells/clip**. BSQ: 210 × 32 × 1 = 6,720
+bits. FSQ at L=8 setting (effective 7 reachable levels after banker's-rounding
+clamp): 210 × 32 × log₂(7) ≈ 18,860 bits.
 
 Full per-metric breakdown with variance and 95% CI: `results/skelvq_comparison.csv`
 (regenerate with `python results/build_comparison_csv.py`).
@@ -66,10 +73,12 @@ VAE, suggesting the gap is in higher-level perceptual quality not captured by Sm
 
 Two reasons (neither alone is sufficient explanation):
 
-1. **Capacity per cell**. With short motion clips (112 cells × 4 scales = 448 token
-   slots) we get ~30× fewer total cells than Infinity's image setup (1024 × 13 ≈ 13k).
-   Per-degree-of-freedom: Infinity 2.16 bits/dof; BSQ on our setup 0.85 bits/dof.
-   FSQ L=8 brings us to 2.55 bits/dof — back into Infinity's regime.
+1. **Capacity per cell**. With short motion clips (210 cells across the residual
+   cascade, vs 4-scale token slots in image setups), each cell needs to encode more
+   information for the recon to be tight. BSQ at 1 bit/channel × 32 ch = 32 bits/cell
+   (≈ 6.7k bits/clip) is below the SALAD VAE's continuous-bottleneck budget of
+   ~17–22k effective bits. FSQ at L=8 setting gives log₂(7)·32 ≈ 90 bits/cell
+   (≈ 18.9k bits/clip) — back inside the VAE's range.
 
 2. **Magnitude preservation**. BSQ requires `l2norm(z)` before `sign(z)`, throwing away
    magnitude information. Pose features (especially `loss_pos` — joint position offsets)
