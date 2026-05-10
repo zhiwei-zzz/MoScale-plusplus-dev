@@ -73,9 +73,7 @@ PLACES = {"FID": 4, "Diversity": 3, "TOP1": 4, "TOP2": 4, "TOP3": 4,
 VAR_PLACES = {"FID": 8, "Diversity": 4, "TOP1": 6, "TOP2": 6, "TOP3": 6,
               "Matching": 5, "MPJPE": 7, "Multimodality": 6}
 
-header = ["run", "bottleneck", "bits_per_clip"]
-for m in METRICS:
-    header += [m, f"{m}_var", f"{m}_conf"]
+header = ["run", "bottleneck", "bits_per_clip"] + METRICS
 
 rows = [header]
 for name, bottleneck, bits, path in RUNS:
@@ -84,8 +82,9 @@ for name, bottleneck, bits, path in RUNS:
     data = parse(path)
     row = [name, bottleneck, bits]
     for m in METRICS:
-        mean, var, conf = stats(data[m])
-        row += [fmt(mean, PLACES[m]), fmt(var, VAR_PLACES[m]), fmt(conf, PLACES[m])]
+        mean, var, _conf = stats(data[m])
+        std = math.sqrt(var)
+        row.append(f"{fmt(mean, PLACES[m])}±{fmt(std, PLACES[m])}")
     rows.append(row)
 
 out_path = ROOT / "results" / "skelvq_comparison.csv"

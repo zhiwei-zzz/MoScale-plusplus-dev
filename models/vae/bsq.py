@@ -276,6 +276,12 @@ class MultiScaleFSQ(nn.Module):
       q_s = FSQ(r_s)
       residual <- residual - upsample(q_s).detach()
       quantized_out += upsample(q_s)
+
+    Effective level count for stage-2 AR (encode_indices / indices_to_codes):
+      For L=8 setting, half=(L-1)/2=3.5; clamped reachable rounded ∈ {-3..3}, so
+      effective_levels = 7. (The banker's-rounding extreme ±4 is reachable only
+      when tanh saturates to exactly 1.0 in float — rare for in-distribution
+      encoder outputs and discarded by the clamp for a clean vocab.)
     """
 
     def __init__(
@@ -346,6 +352,85 @@ class MultiScaleFSQ(nn.Module):
         total_loss = torch.stack(losses).sum()
         avg_diag = torch.stack(diags).mean()
         return quantized_out, total_loss, avg_diag
+
+    @property
+    def effective_levels(self) -> int:
+        """Number of distinct discrete level indices per channel.
+
+        For L=8 setting (half=3.5), this is 7 — the inner range {-3..3} reachable
+        without relying on banker's-rounding edge cases.
+        """
+        return 2 * int(self.fsq.half) + 1
+
+    def indices_to_codes(self, idx: torch.Tensor) -> torch.Tensor:
+        """Inverse of the integer-index emission in `encode_indices`.
+
+        idx: integer tensor with values in [0, effective_levels).
+        Returns: float tensor of the same shape, with values in [-1, +1] on the
+        FSQ grid (rounded / half).
+        """
+        int_half = int(self.fsq.half)
+        rounded = idx.to(dtype=torch.float32) - int_half
+        return rounded / self.fsq.half
+
+    @torch.no_grad()
+    def encode_indices(
+        self, x: torch.Tensor
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        """Run the residual FSQ cascade and return per-scale integer indices.
+
+        x: (B, D, L)
+        Returns three same-length lists, one entry per residual scale:
+          idx_per_scale[s]: (B, L_s, D) int64 — level indices ∈ [0, effective_levels)
+          q_per_scale[s]:   (B, D, L_s) float — dequantized FSQ output at native scale L_s
+          q_cum[s]:         (B, D, L)  float — cumulative dequantized features after scale s,
+                                                upsampled back to the full L
+        Where L_s = max(1, L // scale_s) for scale_s in self.scales.
+
+        The `q_cum` list is what stage-2 (next-scale AR) feeds forward as
+        conditioning input for the next finer scale. Used by the wrapper in
+        moscale/model/vq/skelvq_wrapper.py.
+        """
+        B, D, L = x.shape
+        assert D == self.code_dim, f"expected D={self.code_dim}, got {D}"
+        int_half = int(self.fsq.half)
+        half = self.fsq.half
+
+        residual = x
+        cum = torch.zeros_like(x)
+        idx_per_scale: list[torch.Tensor] = []
+        q_per_scale: list[torch.Tensor] = []
+        q_cum: list[torch.Tensor] = []
+
+        for scale in self.scales:
+            if scale > 1:
+                target_L = max(1, L // scale)
+                interp = F.interpolate(residual, size=target_L, mode="area")
+            else:
+                target_L = L
+                interp = residual
+
+            # Per-channel FSQ at this scale (matches FSQ.forward without the
+            # entropy regularizer and with a clamp to the canonical inner range).
+            z_T = interp.transpose(1, 2).contiguous()  # (B, L_s, D)
+            bounded = half * torch.tanh(z_T)
+            rounded = torch.round(bounded).clamp(-int_half, int_half)  # (B, L_s, D)
+            idx = (rounded + int_half).to(dtype=torch.int64)            # (B, L_s, D), ∈ [0, eff_lvl)
+            q_native = (rounded / half).transpose(1, 2).contiguous()    # (B, D, L_s)
+
+            idx_per_scale.append(idx)
+            q_per_scale.append(q_native)
+
+            if target_L != L:
+                q_up = F.interpolate(q_native, size=L, mode="linear", align_corners=False)
+            else:
+                q_up = q_native
+
+            residual = residual - q_up
+            cum = cum + q_up
+            q_cum.append(cum.clone())
+
+        return idx_per_scale, q_per_scale, q_cum
 
 
 if __name__ == "__main__":

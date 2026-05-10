@@ -178,3 +178,4 @@ log/
 checkpoints/
 archive_*/
 dataset/humanml3d
+results/.~lock.*
