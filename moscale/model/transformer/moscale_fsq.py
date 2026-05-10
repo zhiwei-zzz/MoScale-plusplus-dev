@@ -482,16 +482,35 @@ class MoScaleFSQ(nn.Module):
             train=train,
         )
 
-        # For now we assume fixed-length training (all positions valid). Future
-        # variable-length support: replace this with
-        #   bottleneck_lens = vq_model.compute_bottleneck_lens(m_lens)
-        # and downsample per scale.
+        # Variable-length: per-scale boolean mask `(B, L_s)` — True at valid
+        # positions, False at positions beyond the sample's bottleneck-space
+        # length. For fixed-length training (all m_lens equal), this is all-True.
+        # Per-scale L_s is inferred from id_list[s] (which already has the right
+        # shape from MultiScaleFSQ.encode_indices), and per-sample valid lengths
+        # come from wrapper.compute_bottleneck_lens(m_lens) // scale.
         non_pad_mask = []
-        for ele in id_list:
-            non_pad_mask.append(torch.ones(ele.shape[0], ele.shape[1], dtype=torch.bool, device=ele.device))
+        if hasattr(vq_model, "compute_bottleneck_lens") and m_lens is not None:
+            bottleneck_lens = vq_model.compute_bottleneck_lens(m_lens.to(id_list[0].device))
+        else:
+            bottleneck_lens = None
+        for scale, ele in zip(self.scales, id_list):
+            B, L_s, _D = ele.shape
+            if bottleneck_lens is None:
+                non_pad_mask.append(torch.ones(B, L_s, dtype=torch.bool, device=ele.device))
+            else:
+                ds_mlens = (bottleneck_lens // scale).clamp(min=1, max=L_s).long()
+                non_pad_mask.append(lengths_to_mask(ds_mlens, L_s))
 
         # `labels` for FSQ is (B, L_total, code_dim) — concatenate per-scale (B, L_s, D) along L.
-        labels = torch.cat(id_list, dim=1)
+        # Set padded positions to -1 across all D channels so the forward()'s
+        # `(labels == -1).all(dim=-1)` padded-position check (and CE
+        # ignore_index=-100 path) treat them correctly.
+        masked_id_list = []
+        for ele, mask in zip(id_list, non_pad_mask):
+            ele = ele.clone()
+            ele[~mask] = -1
+            masked_id_list.append(ele)
+        labels = torch.cat(masked_id_list, dim=1)
 
         # Cumulative partial-reconstruction stream: each scale's q_cum is at full L.
         # We use raw_features[i] downsampled to the *next* scale's patch_size.

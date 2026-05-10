@@ -22,9 +22,18 @@ def arg_parse(is_train=False):
     # dataloader
     p.add_argument("--dataset_name", type=str, default="t2m", choices=["t2m", "kit"])
     p.add_argument("--batch_size", default=64, type=int)
-    p.add_argument("--window_size", type=int, default=64,
-                   help="Match the tokenizer's training window. AR sequence length "
-                        "= sum_s (L/scale_s) where L = window/4 * J_b.")
+    p.add_argument("--window_size", type=int, default=196,
+                   help="Maximum motion length in original frames. With variable_length "
+                        "(default), each motion is padded to this length and the AR "
+                        "masks padded positions in the loss. AR sequence length "
+                        "= sum_s (L/scale_s) where L = window_size/4 * J_b.")
+    p.add_argument("--variable_length", action="store_true", default=True,
+                   help="Train on full-length motions padded to window_size. "
+                        "Disable with --fixed_window for the legacy 64-frame slice mode.")
+    p.add_argument("--fixed_window", dest="variable_length", action="store_false")
+    p.add_argument("--unit_length", type=int, default=4,
+                   help="Motion lengths are snapped down to multiples of this so the "
+                        "tokenizer's time downsampling (2**n_layers=4) divides cleanly.")
     p.add_argument("--num_workers", type=int, default=4)
 
     # tokenizer
@@ -113,6 +122,10 @@ def arg_parse(is_train=False):
     opt = p.parse_args()
     torch.cuda.set_device(opt.gpu_id)
     opt.device = torch.device("cpu" if opt.gpu_id == -1 else f"cuda:{opt.gpu_id}")
+
+    # Padded loader uses opt.max_motion_length; alias from window_size for
+    # naming consistency with MoScale's config.
+    opt.max_motion_length = opt.window_size
 
     opt.save_root = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
     opt.model_dir = pjoin(opt.save_root, "model")

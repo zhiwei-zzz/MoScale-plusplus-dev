@@ -30,7 +30,10 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from data.t2m_dataset import MotionDataset, Text2MotionDatasetEval, collate_fn as eval_collate
-from data.t2m_caption_dataset import Text2MotionWindowDataset, collate_fn as caption_collate
+from data.t2m_caption_dataset import (
+    Text2MotionWindowDataset, Text2MotionPaddedDataset,
+    collate_fn as caption_collate,
+)
 from utils.get_opt import get_opt
 from utils.utils import print_current_loss
 from utils.skelvq_ar_eval import make_gen_func, evaluate_once, aggregate_repeats
@@ -83,8 +86,12 @@ def build_dataset(opt):
     train_split = pjoin(opt.data_root, "train.txt")
     val_split = pjoin(opt.data_root, "val.txt")
     if opt.text_cond:
-        train_ds = Text2MotionWindowDataset(opt, mean, std, train_split)
-        val_ds = Text2MotionWindowDataset(opt, mean, std, val_split)
+        if getattr(opt, "variable_length", True):
+            train_ds = Text2MotionPaddedDataset(opt, mean, std, train_split)
+            val_ds = Text2MotionPaddedDataset(opt, mean, std, val_split)
+        else:
+            train_ds = Text2MotionWindowDataset(opt, mean, std, train_split)
+            val_ds = Text2MotionWindowDataset(opt, mean, std, val_split)
     else:
         train_ds = MotionDataset(opt, mean, std, train_split)
         val_ds = MotionDataset(opt, mean, std, val_split)
@@ -92,13 +99,16 @@ def build_dataset(opt):
 
 
 def _unpack_batch(batch, text_cond: bool):
-    """Returns (texts_or_dummy_strs, motion_tensor)."""
+    """Normalize the batch into (texts, motion, m_lengths_or_None)."""
     if text_cond:
+        if len(batch) == 3:
+            captions, motion, m_lengths = batch
+            return list(captions), motion, m_lengths
         captions, motion = batch
-        return list(captions), motion
+        return list(captions), motion, None
     # Unconditional path: feed empty strings (model will replace with cfg_uncond
     # at the configured drop probability).
-    return [""] * batch.shape[0], batch
+    return [""] * batch.shape[0], batch, None
 
 
 def build_cfg(opt) -> OmegaConf:
@@ -135,9 +145,12 @@ def run_validation(ar, vq_model, val_loader, device, text_cond, max_batches=20):
         for i, batch in enumerate(val_loader):
             if i >= max_batches:
                 break
-            texts, motion = _unpack_batch(batch, text_cond)
+            texts, motion, m_lens_in = _unpack_batch(batch, text_cond)
             motion = motion.to(device, dtype=torch.float32)
-            m_lens = torch.full((motion.shape[0],), motion.shape[1], device=device, dtype=torch.long)
+            if m_lens_in is None:
+                m_lens = torch.full((motion.shape[0],), motion.shape[1], device=device, dtype=torch.long)
+            else:
+                m_lens = m_lens_in.to(device, dtype=torch.long)
             loss, _, acc, ps_acc = ar.forward(motion, texts, m_lens.clone(), vq_model, train=False)
             losses.append(loss.item())
             accs.append(acc)
@@ -266,9 +279,12 @@ def main():
                 for g in optim.param_groups:
                     g["lr"] = cur_lr
 
-            texts, motion = _unpack_batch(batch, opt.text_cond)
+            texts, motion, m_lens_in = _unpack_batch(batch, opt.text_cond)
             motion = motion.to(opt.device, dtype=torch.float32)
-            m_lens = torch.full((motion.shape[0],), motion.shape[1], device=opt.device, dtype=torch.long)
+            if m_lens_in is None:
+                m_lens = torch.full((motion.shape[0],), motion.shape[1], device=opt.device, dtype=torch.long)
+            else:
+                m_lens = m_lens_in.to(opt.device, dtype=torch.long)
 
             optim.zero_grad()
             loss, _pred_idx, acc, ps_acc = ar.forward(motion, texts, m_lens.clone(), vq_model, train=True)
