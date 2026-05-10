@@ -602,7 +602,23 @@ class MoScaleFSQ(nn.Module):
             n = mask_valid.float().sum() * self.code_dim
             acc = (correct.float().sum() / n.clamp_min(1)).item() if n > 0 else 0.0
 
-        return ce_loss, pred_idx, acc
+            # Per-scale accuracy: useful diagnostic since scale 0 has no
+            # cumulative-recon hint (only SOS) while scales 1..S-1 do.
+            per_scale_acc = {}
+            offset = 0
+            for si, pl in enumerate(self.patch_sizes):
+                lo, hi = offset, offset + pl
+                pred_s = pred_idx[:, lo:hi]
+                gt_s = labels[:, lo:hi]
+                mask_s = non_pad_mask[:, lo:hi].unsqueeze(-1)
+                n_s = mask_s.float().sum() * self.code_dim
+                correct_s = (pred_s == gt_s) & mask_s
+                per_scale_acc[f"acc_scale_{si}"] = (
+                    (correct_s.float().sum() / n_s.clamp_min(1)).item() if n_s > 0 else 0.0
+                )
+                offset = hi
+
+        return ce_loss, pred_idx, acc, per_scale_acc
 
     def extra_repr(self):
         return f'num_layers={self.num_layers}'

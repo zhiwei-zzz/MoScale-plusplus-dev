@@ -98,6 +98,7 @@ def build_cfg(opt) -> OmegaConf:
 def run_validation(ar, vq_model, val_loader, device, text_cond, max_batches=20):
     ar.train(False)
     losses, accs = [], []
+    per_scale_accs = defaultdict(list)
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
             if i >= max_batches:
@@ -105,11 +106,16 @@ def run_validation(ar, vq_model, val_loader, device, text_cond, max_batches=20):
             texts, motion = _unpack_batch(batch, text_cond)
             motion = motion.to(device, dtype=torch.float32)
             m_lens = torch.full((motion.shape[0],), motion.shape[1], device=device, dtype=torch.long)
-            loss, pred_idx, acc = ar.forward(motion, texts, m_lens.clone(), vq_model, train=False)
+            loss, _, acc, ps_acc = ar.forward(motion, texts, m_lens.clone(), vq_model, train=False)
             losses.append(loss.item())
             accs.append(acc)
+            for k, v in ps_acc.items():
+                per_scale_accs[k].append(v)
     ar.train(True)
-    return float(np.mean(losses)) if losses else 0.0, float(np.mean(accs)) if accs else 0.0
+    val_loss = float(np.mean(losses)) if losses else 0.0
+    val_acc = float(np.mean(accs)) if accs else 0.0
+    val_ps_acc = {k: float(np.mean(v)) for k, v in per_scale_accs.items()}
+    return val_loss, val_acc, val_ps_acc
 
 
 def main():
@@ -187,7 +193,7 @@ def main():
             m_lens = torch.full((motion.shape[0],), motion.shape[1], device=opt.device, dtype=torch.long)
 
             optim.zero_grad()
-            loss, _pred_idx, acc = ar.forward(motion, texts, m_lens.clone(), vq_model, train=True)
+            loss, _pred_idx, acc, ps_acc = ar.forward(motion, texts, m_lens.clone(), vq_model, train=True)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(ar.parameters(), opt.grad_clip)
             optim.step()
@@ -199,6 +205,8 @@ def main():
             logs["lr"] += optim.param_groups[0]["lr"]
             logs["grad_norm"] += float(grad_norm)
             logs["acc"] += acc
+            for k, v in ps_acc.items():
+                logs[k] += v
 
             if it % opt.log_every == 0:
                 mean_loss = OrderedDict()
@@ -226,10 +234,13 @@ def main():
 
         epoch += 1
         if epoch % opt.eval_every_e == 0:
-            val_loss, val_acc = run_validation(ar, vq_model, val_loader, opt.device, opt.text_cond)
-            print(f"[val] ep {epoch}: loss {val_loss:.4f}  acc {val_acc:.4f}")
+            val_loss, val_acc, val_ps_acc = run_validation(ar, vq_model, val_loader, opt.device, opt.text_cond)
+            ps_str = "  ".join(f"{k}={v:.3f}" for k, v in val_ps_acc.items())
+            print(f"[val] ep {epoch}: loss {val_loss:.4f}  acc {val_acc:.4f}  {ps_str}")
             logger.add_scalar("Val/loss", val_loss, it)
             logger.add_scalar("Val/acc", val_acc, it)
+            for k, v in val_ps_acc.items():
+                logger.add_scalar(f"Val/{k}", v, it)
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save({"ar": ar.state_dict(), "epoch": epoch, "val_loss": val_loss,
