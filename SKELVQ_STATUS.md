@@ -40,8 +40,15 @@ window 64, latent_dim 32, n_layers 2.
 |---|---|---|---|---|---|---|
 | `vae_repro` | continuous Gaussian + KL | (effective ~17-22k) | **0.003 ± 0.000** | 0.016 | 9.510 | 0.797 |
 | `skelvq_bsq` | BSQ (1 bit/channel × 32 × 4 scales) | 14,336 | 0.021 ± 0.000 | 0.029 | 9.432 | 0.796 |
-| `skelvq_fsq` (live) | FSQ L=8 (3 bits/channel × 32 × 4 scales) | ~43,008 | TBD | TBD | TBD | TBD |
-| `skelvq_fsq_reg` (queued) | FSQ L=8 + LFQ-style entropy regularizer | ~43,008 | TBD | TBD | TBD | TBD |
+| `skelvq_fsq` | FSQ L=8 (3 bits/channel × 32 × 4 scales) | 43,008 | **0.007 ± 0.000** | 0.019 | 9.438 | 0.797 |
+
+Full per-metric breakdown with variance and 95% CI: `results/skelvq_comparison.csv`
+(regenerate with `python results/build_comparison_csv.py`).
+
+**Headline:** FSQ closes ~78% of the BSQ→VAE FID gap (BSQ was 7× the VAE; FSQ is 2.3×)
+while matching VAE on R-precision and Diversity. The skelvq_fsq_reg regularized variant
+was descoped — entropy regularization is queued only if there's a downstream reason to
+push level utilization above 0.42.
 
 **Key per-term observations** (validation losses at ep 40, mid-FSQ run):
 
