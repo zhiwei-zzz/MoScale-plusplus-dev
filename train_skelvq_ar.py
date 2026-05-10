@@ -214,6 +214,48 @@ def main():
     best_fid = float("inf")
     logs = defaultdict(def_value, OrderedDict())
 
+    # ----- pre-train baseline eval (matches MoScale's pattern at
+    # transformer_trainer.py:106-112: get a random-init / resumed baseline
+    # before any optimizer step, plus a sanity check that the gen-eval
+    # pipeline is wired correctly *before* committing 200+ epochs of compute).
+    print(f"\n=== pre-train baseline eval at it={it} ===")
+    val_loss, val_acc, val_ps_acc = run_validation(ar, vq_model, val_loader, opt.device, opt.text_cond)
+    ps_str = "  ".join(f"{k}={v:.3f}" for k, v in val_ps_acc.items())
+    print(f"[val] pre-train: loss {val_loss:.4f}  acc {val_acc:.4f}  {ps_str}")
+    logger.add_scalar("Val/loss", val_loss, it)
+    logger.add_scalar("Val/acc", val_acc, it)
+    for k, v in val_ps_acc.items():
+        logger.add_scalar(f"Val/{k}", v, it)
+
+    if gen_eval_bundle is not None:
+        eval_loader, eval_wrapper = gen_eval_bundle
+        gen_func = make_gen_func(
+            ar, vq_model, cond_scale=opt.fid_cond_scale,
+            temperature=opt.fid_temperature, top_p=opt.fid_top_p,
+            device=str(opt.device),
+        )
+        metric_runs = []
+        for r in range(opt.fid_repeat_times):
+            m = evaluate_once(ar, vq_model, eval_loader, eval_wrapper, gen_func, str(opt.device))
+            metric_runs.append(m)
+        agg = aggregate_repeats(metric_runs)
+        ar.train(True)
+        msg = (
+            f"[gen-eval] pre-train  "
+            f"FID {agg['fid']:.4f}±{agg.get('fid_conf95', 0):.4f}  "
+            f"top1 {agg['top1']:.4f}  top2 {agg['top2']:.4f}  top3 {agg['top3']:.4f}  "
+            f"Div {agg['diversity']:.3f} (real {agg['diversity_real']:.3f})  "
+            f"Match {agg['matching']:.3f}"
+        )
+        print(msg)
+        for k, v in agg.items():
+            if not k.endswith("_conf95"):
+                logger.add_scalar(f"GenEval/{k}", v, it)
+        # Don't save net_best_fid.tar at pre-train (random init or just-resumed
+        # ckpt; the parent ckpt is already on disk if resumed). Just record the
+        # baseline FID so subsequent in-loop evals compare against it.
+        best_fid = agg["fid"]
+
     # ----- train loop
     while epoch < opt.max_epoch:
         ar.train(True)
