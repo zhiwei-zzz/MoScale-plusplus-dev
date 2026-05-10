@@ -40,6 +40,15 @@ def arg_parse(is_train=False):
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--use_lvl_embed", action="store_true", default=True)
 
+    # text conditioning + classifier-free guidance
+    p.add_argument("--text_cond", action="store_true", default=True,
+                   help="Use T5 cross-attention. Default on. Pass --no_text_cond for unconditional.")
+    p.add_argument("--no_text_cond", dest="text_cond", action="store_false")
+    p.add_argument("--t5_model", type=str, default="google/t5-v1_1-base")
+    p.add_argument("--t5_max_len", type=int, default=20)
+    p.add_argument("--cond_drop_prob", type=float, default=0.1,
+                   help="Probability of replacing text condition with cfg_uncond at training time.")
+
     # level self-correction (Infinity BSC port)
     p.add_argument("--noise_apply_layers", type=int, default=-1,
                    help="-1 disables noise; otherwise apply to first N residual scales.")
