@@ -87,13 +87,13 @@ def arg_parse(is_train=False):
     p.add_argument("--is_continue", action="store_true")
 
     # periodic generation-quality eval (FID + R-precision + Diversity)
-    p.add_argument("--fid_every_e", default=-1, type=int,
-                   help="Run a full SALAD-evaluator generation-quality eval every "
-                        "N epochs. -1 disables. ~1-2 min/repeat on a 3090, plus the "
-                        "one-time evaluator + word-vectorizer load (~10 s).")
+    p.add_argument("--fid_every_e", default=4, type=int,
+                   help="Run a SALAD-evaluator generation-quality eval every N epochs. "
+                        "Set -1 to disable. Default 4. ~30-60s per repeat on a 3090.")
     p.add_argument("--fid_repeat_times", default=1, type=int,
-                   help="Repeat count for the in-training gen eval. Use 1 for cheap, "
-                        "20 for the full paper protocol (use eval_skelvq_ar.py for that).")
+                   help="Repeat count for the in-training gen eval. Use 1 (default) for "
+                        "cheap; 20 for the full paper protocol (or use eval_skelvq_ar.py "
+                        "post-training for that).")
     p.add_argument("--fid_cond_scale", default=4.0, type=float,
                    help="Classifier-free guidance scale at gen-eval time.")
     p.add_argument("--fid_top_p", default=0.9, type=float)
