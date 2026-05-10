@@ -514,6 +514,21 @@ class MoScaleFSQ(nn.Module):
 
         # Cumulative partial-reconstruction stream: each scale's q_cum is at full L.
         # We use raw_features[i] downsampled to the *next* scale's patch_size.
+        #
+        # Zero out padded positions in raw_features BEFORE downsampling — same
+        # pattern SALAD's VAE uses on its quantized features pre-decoder. Without
+        # this, the encoder's outputs at zero-padded frames (which are arbitrary
+        # garbage values produced by the conv kernel folding zero pad) would feed
+        # into the AR's conditioning stream and pollute the area-pooled features
+        # for nearby valid cells.
+        if bottleneck_lens is not None:
+            full_L = raw_features[0].shape[-1]
+            valid_full_mask = lengths_to_mask(
+                bottleneck_lens.clamp(min=1, max=full_L).long(), full_L
+            )                                                 # (B, full_L) bool
+            mask_BCL = valid_full_mask.unsqueeze(1).float()    # (B, 1, full_L) for broadcast
+            raw_features = [rf * mask_BCL for rf in raw_features]
+
         downsampled_feature_list = []
         for i in range(len(self.patch_sizes) - 1):
             next_size = self.patch_sizes[i + 1]
