@@ -64,11 +64,19 @@ def evaluate_once(
         m_length = m_length.to(device, dtype=torch.long)
         bs = motion.shape[0]
 
+        # Generate first; AR is window-trained so pred_motion may be shorter
+        # than the eval set's full T (e.g. 64 vs 196). Truncate motion + m_length
+        # to pred's T so FID compares like-to-like at the AR's output length.
+        pred_motion, _ = gen_func((caption, motion, m_length))
+        T_pred = pred_motion.shape[1]
+        if motion.shape[1] != T_pred:
+            motion = motion[:, :T_pred].contiguous()
+            m_length = m_length.clamp(max=T_pred)
+
         et, em = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, motion, m_length)
         R_precision_real += calculate_R_precision(et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
         matching_score_real += euclidean_distance_matrix(et.cpu().numpy(), em.cpu().numpy()).trace()
 
-        pred_motion, _ = gen_func((caption, motion, m_length))
         mask = torch.arange(motion.shape[1]).unsqueeze(0).expand(bs, -1).to(device) >= m_length.unsqueeze(1)
         pred_motion = pred_motion.masked_fill(mask.unsqueeze(-1), 0)
         et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motion, m_length)
