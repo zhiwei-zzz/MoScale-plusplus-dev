@@ -34,6 +34,8 @@ def arg_parse(is_train=False):
 
     # AR transformer
     p.add_argument("--latent_dim", type=int, default=384, help="transformer hidden dim")
+    p.add_argument("--head_latent_dim", type=int, default=-1,
+                   help="output-head hidden dim. -1 (default) means follow --latent_dim.")
     p.add_argument("--num_layers", type=int, default=8)
     p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--mlp_ratio", type=float, default=4.0)

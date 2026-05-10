@@ -98,9 +98,10 @@ def _unpack_batch(batch, text_cond: bool):
 
 def build_cfg(opt) -> OmegaConf:
     """Synthesize the OmegaConf config object MoScaleFSQ expects."""
+    head_latent_dim = opt.head_latent_dim if opt.head_latent_dim > 0 else opt.latent_dim
     return OmegaConf.create({
         "model": dict(
-            latent_dim=opt.latent_dim, head_latent_dim=opt.latent_dim,
+            latent_dim=opt.latent_dim, head_latent_dim=head_latent_dim,
             num_layers=opt.num_layers, n_heads=opt.num_heads,
             mlp_ratio=opt.mlp_ratio, dropout=opt.dropout, attn_drop_rate=0.0,
             use_crossattn=True, attn_l2_norm=False, infer_use_kvcache=False,

@@ -303,6 +303,16 @@ class MoScaleFSQ(nn.Module):
         self.token_dim_proj = nn.Linear(self.code_dim, self.latent_dim)
         self.latent_dim_proj = nn.Linear(self.latent_dim*2, self.head_latent_dim)
 
+        # FSQ pure-AR path: BERT mask aug is removed, so the residual stream
+        # arrives at blocks at `latent_dim` (single stream), not `2*latent_dim`.
+        # Project to `head_latent_dim` here so block embed_dim, pos_start,
+        # lvl_embed, and head ops all line up when head_latent_dim != latent_dim.
+        self.input_to_block = (
+            nn.Linear(self.latent_dim, self.head_latent_dim)
+            if self.head_latent_dim != self.latent_dim
+            else nn.Identity()
+        )
+
         self.noise_schedule = cosine_schedule
 
         self.bert_replace_prob = 0.1
@@ -572,6 +582,7 @@ class MoScaleFSQ(nn.Module):
 
         # Pure AR: single-stream (no per-position token concat).
         x_BLC_token = x_BLC
+        x_BLC_token = self.input_to_block(x_BLC_token)
 
         for block_i, b in enumerate(self.masked_blocks):
             if block_i == 0:
@@ -709,6 +720,7 @@ class MoScaleFSQ(nn.Module):
             else:
                 x_in = torch.cat([x_in, next_token_map], dim=1)
             x_out_token = x_in.clone()
+            x_out_token = self.input_to_block(x_out_token)
 
             cur_attn_bias = attn_bias[:, :, :cur_L, :cur_L]
 
