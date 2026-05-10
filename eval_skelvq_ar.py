@@ -26,7 +26,7 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-from data.t2m_dataset import Text2MotionDatasetEval
+from data.t2m_dataset import Text2MotionDatasetEval, collate_fn as eval_collate
 from models.t2m_eval_wrapper import EvaluatorModelWrapper
 from utils.get_opt import get_opt
 from utils.skelvq_ar_eval import make_gen_func, evaluate_once, aggregate_repeats
@@ -107,8 +107,11 @@ def main():
     w_vec = WordVectorizer(args.glove_dir, "our_vab")
     test_split = pjoin(args.data_root, "test.txt")
     eval_ds = Text2MotionDatasetEval(wrapper_opt, mean, std, test_split, w_vec)
+    # collate_fn sorts by sent_len desc — required by the SALAD/MoScale evaluator's
+    # pack_padded_sequence (enforce_sorted=True default). Mirrors upstream usage.
     eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=args.num_workers, drop_last=False, pin_memory=True)
+                             num_workers=args.num_workers, drop_last=False, pin_memory=True,
+                             collate_fn=eval_collate)
     eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
 
     gen_func = make_gen_func(ar, vq_model, args.cond_scale, args.temperature, args.top_p, args.device)

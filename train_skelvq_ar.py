@@ -29,7 +29,7 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-from data.t2m_dataset import MotionDataset, Text2MotionDatasetEval
+from data.t2m_dataset import MotionDataset, Text2MotionDatasetEval, collate_fn as eval_collate
 from data.t2m_caption_dataset import Text2MotionWindowDataset, collate_fn as caption_collate
 from utils.get_opt import get_opt
 from utils.utils import print_current_loss
@@ -64,8 +64,13 @@ def build_gen_eval(opt, vq_model_device):
     val_split = pjoin(opt.data_root, "val.txt")
     w_vec = WordVectorizer(opt.glove_dir, "our_vab")
     eval_ds = Text2MotionDatasetEval(wrapper_opt, mean, std, val_split, w_vec)
+    # collate_fn sorts by sent_len desc — required by the SALAD/MoScale evaluator's
+    # pack_padded_sequence which uses the default enforce_sorted=True. Mirrors how
+    # both upstream projects build their eval DataLoaders (motion_loaders/dataset_motion_loader.py
+    # and moscale/model/evaluator/hml/dataset_motion_loader.py).
     eval_loader = DataLoader(eval_ds, batch_size=opt.batch_size, shuffle=False,
-                             num_workers=opt.num_workers, drop_last=False, pin_memory=True)
+                             num_workers=opt.num_workers, drop_last=False, pin_memory=True,
+                             collate_fn=eval_collate)
     eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
     print(f"  eval set: {len(eval_ds)} samples")
     return eval_loader, eval_wrapper
