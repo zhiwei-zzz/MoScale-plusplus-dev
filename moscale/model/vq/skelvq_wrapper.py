@@ -293,20 +293,35 @@ class SkelVQWrapper(nn.Module):
         self,
         motion: torch.Tensor,
         m_lens: Optional[torch.Tensor] = None,
-        perturb_rate=None,           # accepted for API parity with HRVQVAE; unused
+        perturb_rate=None,
         codebook=None,
         train: bool = False,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         """Drop-in for HRVQVAE.encode.
 
+        Args:
+            perturb_rate: optional [lo, hi] pair. When non-zero AND `train=True`,
+                level indices in the residual cascade are perturbed (uniform
+                Categorical resample to non-true levels) at a per-step rate
+                drawn uniformly in [lo, hi]. The cascade re-quantizes with the
+                perturbed codes so the propagated `q_cum` reflects corruption,
+                while the returned `idx_list` stays the **clean** GT — that's
+                the AR transformer's CE target. Mirrors MoScale's MSQuantizer
+                perturb / Infinity's Bitwise Self-Correction.
+            train: must be True for perturbation to fire.
+
         Returns:
             idx_list[s]:   (B, L_s, code_dim) int64,  ∈ [0, effective_levels)
-            q_cum_list[s]: (B, code_dim, L)  float,   cumulative dequantized after scale s
+                           — clean GT indices, suitable as CE targets.
+            q_cum_list[s]: (B, code_dim, L)  float,   cumulative dequantized
+                           after scale s. Reflects perturbation when active.
             f_hat:         (B, code_dim, L)  float,   == q_cum_list[-1]
         """
-        del perturb_rate, codebook, train  # FSQ wrapper is frozen; no level perturb here.
+        del codebook  # unused; HRVQVAE-only knob.
         z_1d, _T_b, _J_b = self._encode_to_grid(motion)
-        idx_list, _q_per_scale, q_cum_list = self.skelvq.quantizer.encode_indices(z_1d)
+        idx_list, _q_per_scale, q_cum_list = self.skelvq.quantizer.encode_indices(
+            z_1d, perturb_rate=perturb_rate, train=train,
+        )
         f_hat = q_cum_list[-1]
         return idx_list, q_cum_list, f_hat
 

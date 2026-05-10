@@ -375,26 +375,60 @@ class MultiScaleFSQ(nn.Module):
 
     @torch.no_grad()
     def encode_indices(
-        self, x: torch.Tensor
+        self,
+        x: torch.Tensor,
+        perturb_rate=None,
+        train: bool = False,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         """Run the residual FSQ cascade and return per-scale integer indices.
 
-        x: (B, D, L)
-        Returns three same-length lists, one entry per residual scale:
-          idx_per_scale[s]: (B, L_s, D) int64 — level indices ∈ [0, effective_levels)
-          q_per_scale[s]:   (B, D, L_s) float — dequantized FSQ output at native scale L_s
-          q_cum[s]:         (B, D, L)  float — cumulative dequantized features after scale s,
-                                                upsampled back to the full L
-        Where L_s = max(1, L // scale_s) for scale_s in self.scales.
+        Args:
+          x: (B, D, L) — pre-quantize 1D features.
+          perturb_rate: optional [lo, hi] pair (or scalar). When non-zero AND
+              `train=True`, mimic MoScale's MSQuantizer perturb / Infinity's
+              Bitwise Self-Correction: at each scale, sample a per-step rate
+              uniformly in [lo, hi], then with that probability replace each
+              (cell, channel) GT level index with a uniform Categorical
+              resample over {0..effective_levels-1} **excluding the true
+              level**. The cascade then re-quantizes the residual with the
+              *perturbed* indices so subsequent scales see the corruption
+              (matches Infinity's `noise_apply_requant=1` default).
+          train: must be True for perturbation to fire.
 
-        The `q_cum` list is what stage-2 (next-scale AR) feeds forward as
-        conditioning input for the next finer scale. Used by the wrapper in
-        moscale/model/vq/skelvq_wrapper.py.
+        Returns three same-length lists, one entry per residual scale:
+          idx_per_scale[s]: (B, L_s, D) int64 — GT level indices computed
+              from the residual that the encoder *would* have seen entering
+              scale s. When perturbation is active, the residual at s>=1
+              already incorporates the corruption from earlier scales, so
+              `idx_per_scale[s]` is "the optimal code given the imperfect
+              partial reconstruction so far" — exactly the AR's CE target.
+              Matches Infinity's BSC semantics: at scale 0 these are equal
+              to the clean encoder output; at later scales they differ
+              proportionally to the accumulated corruption.
+          q_per_scale[s]:   (B, D, L_s) float — dequantized at native scale L_s.
+              When perturbation is active, this reflects the *perturbed* code
+              (so it lines up with the corrupted residual cascade fed forward
+              through `q_cum`).
+          q_cum[s]:         (B, D, L)  float — cumulative dequantized after
+              scale s, upsampled back to full L. Reflects the perturbed
+              cascade when perturbation is active.
+
+        Where L_s = max(1, L // scale_s) for scale_s in self.scales.
         """
         B, D, L = x.shape
         assert D == self.code_dim, f"expected D={self.code_dim}, got {D}"
         int_half = int(self.fsq.half)
         half = self.fsq.half
+        eff_lvl = 2 * int_half + 1
+
+        # Resolve perturb rate — mirror MSQuantizer's [lo, hi] pair convention.
+        if perturb_rate is None:
+            lo = hi = 0.0
+        elif isinstance(perturb_rate, (int, float)):
+            lo, hi = 0.0, float(perturb_rate)
+        else:
+            lo, hi = float(perturb_rate[0]), float(perturb_rate[1])
+        do_perturb = train and hi > 0.0
 
         residual = x
         cum = torch.zeros_like(x)
@@ -410,15 +444,42 @@ class MultiScaleFSQ(nn.Module):
                 target_L = L
                 interp = residual
 
-            # Per-channel FSQ at this scale (matches FSQ.forward without the
-            # entropy regularizer and with a clamp to the canonical inner range).
-            z_T = interp.transpose(1, 2).contiguous()  # (B, L_s, D)
+            # Per-channel FSQ at this scale (clean GT indices).
+            z_T = interp.transpose(1, 2).contiguous()                    # (B, L_s, D)
             bounded = half * torch.tanh(z_T)
-            rounded = torch.round(bounded).clamp(-int_half, int_half)  # (B, L_s, D)
-            idx = (rounded + int_half).to(dtype=torch.int64)            # (B, L_s, D), ∈ [0, eff_lvl)
-            q_native = (rounded / half).transpose(1, 2).contiguous()    # (B, D, L_s)
+            rounded = torch.round(bounded).clamp(-int_half, int_half)    # (B, L_s, D)
+            idx_gt = (rounded + int_half).to(dtype=torch.int64)           # (B, L_s, D), ∈ [0, eff_lvl)
+            idx_per_scale.append(idx_gt)
 
-            idx_per_scale.append(idx)
+            if do_perturb:
+                # Per-step strength uniform in [lo, hi] — matches Infinity's
+                # `np.random.randint(0, 100*strength+1) * 0.01` discretized
+                # uniform sampling and MoScale's `random.uniform(lo, hi)`.
+                import random as _random
+                rate = _random.uniform(lo, hi)
+                if rate > 0:
+                    mask = torch.rand_like(idx_gt, dtype=torch.float32) < rate
+                    if mask.any():
+                        # Resample uniformly over {0..eff_lvl-2}, then bump up
+                        # by 1 wherever the resample matches the true level —
+                        # this gives a uniform Categorical over the (eff_lvl-1)
+                        # *non-true* levels, matching MSQuantizer's
+                        # `r + (r >= true)` trick.
+                        flat_true = idx_gt[mask]
+                        r = torch.randint(0, eff_lvl - 1, (flat_true.numel(),),
+                                          dtype=torch.int64, device=idx_gt.device)
+                        r = r + (r >= flat_true).to(torch.int64)
+                        idx_eff = idx_gt.clone()
+                        idx_eff[mask] = r
+                    else:
+                        idx_eff = idx_gt
+                else:
+                    idx_eff = idx_gt
+            else:
+                idx_eff = idx_gt
+
+            # Convert (perturbed if active, else clean) indices to continuous codes.
+            q_native = self.indices_to_codes(idx_eff).permute(0, 2, 1).contiguous()  # (B, D, L_s)
             q_per_scale.append(q_native)
 
             if target_L != L:

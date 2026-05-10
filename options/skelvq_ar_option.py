@@ -49,9 +49,23 @@ def arg_parse(is_train=False):
     p.add_argument("--cond_drop_prob", type=float, default=0.1,
                    help="Probability of replacing text condition with cfg_uncond at training time.")
 
-    # level self-correction (Infinity BSC port)
-    p.add_argument("--noise_apply_layers", type=int, default=-1,
-                   help="-1 disables noise; otherwise apply to first N residual scales.")
+    # level perturbation — MoScale's perturb_rate / Infinity's BSC, FSQ-flavored.
+    # When `hi > 0` AND model is in train mode, at each residual scale a
+    # per-step rate is sampled uniformly in [lo, hi]; with that probability
+    # each (cell, channel) GT level index is replaced with a uniform
+    # Categorical resample over {0..effective_levels-2}+1@true (non-true
+    # levels). The cascade re-quantizes with the perturbed codes (Infinity's
+    # `noise_apply_requant=1` semantic) so the propagated f_hat reflects
+    # corruption; CE targets stay the clean GT indices. Defaults match
+    # MoScale's HRVQVAE setting.
+    p.add_argument("--perturb_lo", type=float, default=0.0,
+                   help="lower bound of the per-step perturbation rate")
+    p.add_argument("--perturb_hi", type=float, default=0.6,
+                   help="upper bound of the per-step perturbation rate. Set 0 to disable.")
+
+    # (legacy LSC knobs, unused by MoScaleFSQ but kept for the minimal
+    # SkelVQAR backbone)
+    p.add_argument("--noise_apply_layers", type=int, default=-1)
     p.add_argument("--noise_apply_strength", type=float, default=0.3)
     p.add_argument("--noise_apply_requant", action="store_true", default=True)
 

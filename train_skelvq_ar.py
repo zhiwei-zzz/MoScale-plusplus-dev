@@ -83,7 +83,10 @@ def build_cfg(opt) -> OmegaConf:
         "data": dict(dim_pose=opt.pose_dim, max_motion_length=opt.window_size,
                      max_text_length=opt.t5_max_len),
         "training": dict(
-            perturb_rate=[0.0, 0.0],
+            # perturb_rate is plumbed through to SkelVQWrapper.encode and on
+            # to MultiScaleFSQ.encode_indices, which applies a per-step
+            # uniform Categorical level resample at training time only.
+            perturb_rate=[opt.perturb_lo, opt.perturb_hi],
             cond_drop_prob=opt.cond_drop_prob,
             sample_level_times=[1, 1, 1, 1],
         ),
