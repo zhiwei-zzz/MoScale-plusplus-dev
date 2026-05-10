@@ -1,10 +1,12 @@
 # Stage-2 — MoScale + SkelVQ-FSQ integration
 
 This is the on-ramp document for cluster work on stage 2 (text-to-motion AR
-on top of the trained SkelVQ-FSQ tokenizer). The integration backbone is
-landed and end-to-end smoke-tested (single-batch overfit: loss 2.11 → 0.009
-in 100 steps on 7.35M-param AR). Architectural recipe verified from
-**Infinity** (arxiv 2412.04431) and ported to FSQ.
+on top of the trained SkelVQ-FSQ tokenizer). **Pipeline is now end-to-end
+ready** — training launcher verified on real HumanML3D (loss 0.66, acc 70%
+at 7k iters), generate() runs scale-by-scale with CFG, eval script computes
+FID via SALAD's evaluator. Architecture: MoScale's transformer adapted with
+mask path removed (see `moscale_fsq.py`); recipe matches **Infinity**
+(arxiv 2412.04431) for the FSQ side.
 
 ## Quick start on the cluster
 
@@ -13,24 +15,42 @@ in 100 steps on 7.35M-param AR). Architectural recipe verified from
 git clone git@github.com:zhiwei-zzz/MoScale-plusplus-dev.git
 cd MoScale-plusplus-dev
 pip install -r requirements.txt           # SALAD's deps
-pip install 'protobuf<5'                   # TensorBoard 2.14 compat
-pip install huggingface_hub                # for ckpt download
+pip install 'protobuf<5' omegaconf huggingface_hub
+                                          # protobuf<5 for TensorBoard 2.14 compat
+                                          # omegaconf for MoScaleFSQ cfg
+                                          # huggingface_hub for ckpt download
 
 # 2. Pull the trained SkelVQ-FSQ tokenizer from the HF private repo
-export HF_TOKEN=hf_...                     # read-scope token from huggingface.co/settings/tokens
+export HF_TOKEN=hf_...                     # read-scope token
 python scripts/download_checkpoints.py \
     --repo-id zzwalala/moscale-plusplus \
     --runs skelvq_fsq
-# now at: checkpoints/t2m/skelvq_fsq/model/net_best_fid.tar
 
-# 3. (For full SALAD eval / dataset access) set up data + evaluator
+# 3. Set up HumanML3D + the SALAD evaluator
 ln -s /your/path/to/HumanML3D dataset/humanml3d
 bash prepare/download_t2m.sh               # pretrained evaluator
 bash prepare/download_glove.sh
 
-# 4. Verify the integration end-to-end (no dataset needed; uses random motion)
+# 4. (Optional) Verify the architecture roundtrips before training
 python moscale/test_skelvq_ar.py --steps 100 --lr 3e-4
-# expect: final loss < 0.05, acc > 0.99
+# expect: final loss < 0.05, acc > 0.99 (this overfits a random batch through
+# the SkelVQAR minimal backbone; it's an architectural sanity check, not a
+# real training run)
+
+# 5. Train the text-to-motion AR (MoScaleFSQ)
+python train_skelvq_ar.py \
+    --name skelvq_ar_v1 \
+    --batch_size 32 --max_epoch 200 \
+    --num_layers 8 --num_heads 8 --latent_dim 384 \
+    --cond_drop_prob 0.1 \
+    --use_wandb
+
+# 6. After training, evaluate generation FID (20-rep, paper-style)
+python eval_skelvq_ar.py \
+    --name skelvq_ar_v1 \
+    --tokenizer_ckpt checkpoints/t2m/skelvq_fsq/model/net_best_fid.tar \
+    --ar_ckpt checkpoints/t2m/skelvq_ar_v1/model/net_best_loss.tar \
+    --cond_scale 4.0 --top_p 0.9 --repeat_times 20
 ```
 
 ## Other docs
@@ -48,33 +68,26 @@ python moscale/test_skelvq_ar.py --steps 100 --lr 3e-4
 
 | Component | Path | Notes |
 |---|---|---|
-| FSQ index API | `models/vae/bsq.py:MultiScaleFSQ.encode_indices`, `indices_to_codes`, `effective_levels` | Per-scale `(B, L_s, D)` int indices in [0, 7); roundtrip exact vs `MultiScaleFSQ.forward(x)[0]`. **`effective_levels=7`** (not 8) — `round(half·tanh(z))` with banker's rounding gives 7 distinct levels for the L=8 setting; verified empirically. |
-| SkelVQ wrapper | `moscale/model/vq/skelvq_wrapper.py:SkelVQWrapper` | HRVQVAE-shaped API around frozen SkelVQ-FSQ ckpt. Handles the SALAD ↔ moscale `utils/` import collision via sys.path / sys.modules isolation at construction time. Tested at T=64 (training distribution) and T=196 (MoScale's max length, L=343). |
-| Level Self-Correction | `moscale/model/level_self_correction.py:LevelSelfCorrection` | Port of Infinity's `BitwiseSelfCorrection`. Bit-flip → uniform Categorical resample over {0..6}. Defaults: `noise_apply_strength=0.3`, `noise_apply_layers=-1` (off), `noise_apply_requant=True`. |
-| AR transformer | `moscale/model/transformer/skelvq_ar.py:SkelVQAR` | Minimal but correct: `word_embed = Linear(d_vae, C)` over continuous code, block-causal mask, per-scale embedding, learned SOS, `head = Linear(C, d_vae × 7)` with per-channel CE. 7.35M params at default config. |
-| Smoke test | `moscale/test_skelvq_ar.py` | Loads ckpt → encodes → LSC → AR forward + 100 backward steps. Verifies `loss < uniform_baseline × 0.7` and `acc > 1.5 / effective_levels`. |
-| HF ckpt sync | `scripts/upload_checkpoints.py`, `scripts/download_checkpoints.py` | Push trained tokenizer (or all stage-1 runs) to a private HF model repo + pull on cluster. Defaults to uploading only `model/net_best_fid.tar` + `opt.txt` + `eval/eval.log` (~700 KB per run). |
+| FSQ index API | `models/vae/bsq.py:MultiScaleFSQ.encode_indices`, `indices_to_codes`, `effective_levels` | Per-scale `(B, L_s, D)` int indices in [0, 7). **`effective_levels=7`** (not 8) — banker's rounding on `round(half·tanh(z))` gives 7 distinct levels for the L=8 setting. |
+| SkelVQ wrapper | `moscale/model/vq/skelvq_wrapper.py:SkelVQWrapper` | HRVQVAE-shaped API around frozen SkelVQ-FSQ ckpt. Handles the SALAD ↔ moscale `utils/` import collision via sys.path / sys.modules isolation. Verified at T=64 (training) and T=196 (L=343). |
+| Level Self-Correction | `moscale/model/level_self_correction.py:LevelSelfCorrection` | Port of Infinity's `BitwiseSelfCorrection`. Uniform Categorical resample over {0..6}. Wired only in the minimal `SkelVQAR` path; `MoScaleFSQ` doesn't use it yet (works without). |
+| **MoScaleFSQ (text-to-motion AR)** | `moscale/model/transformer/moscale_fsq.py:MoScaleFSQ` | **Surgical fork of MoScale's transformer**: T5 cross-attention, AdaLN, RoPE preserved verbatim; output head emits `code_dim*effective_levels` logits per position; per-channel CE loss; BERT-style mask augmentation removed; `generate()` is single-pass per scale. ~15M params at depth-4. |
+| Caption-aware data loader | `data/t2m_caption_dataset.py:Text2MotionWindowDataset` | Window-based caption pairs (caption + 64-frame motion window) using SALAD's evaluator stats for normalization (matches the tokenizer's training distribution). |
+| Training launcher | `train_skelvq_ar.py` | Loads frozen tokenizer, builds `MoScaleFSQ`, trains text-conditional AR with CFG dropout. **Verified on real HumanML3D**: loss 0.66, accuracy 70% at iter 7200 (3 min on a 3090 Ti). |
+| Generation eval | `eval_skelvq_ar.py` | Generates motion from captions, decodes via wrapper, computes FID + R-precision + Diversity via SALAD's evaluator. 20-rep paper-style protocol. |
+| Minimal backbone (alt) | `moscale/model/transformer/skelvq_ar.py:SkelVQAR` | From-scratch reference: cleaner code, fewer features (no AdaLN, no RoPE). Single-batch overfit verified (loss 2.11 → 0.009). Useful for ablations or as a fallback if MoScaleFSQ has bugs. |
+| Smoke test | `moscale/test_skelvq_ar.py` | 100-step single-batch overfit through the minimal `SkelVQAR` — fast architectural sanity check independent of MoScaleFSQ. |
+| HF ckpt sync | `scripts/upload_checkpoints.py`, `scripts/download_checkpoints.py` | Push/pull trained checkpoints between local and cluster via a private HF model repo. |
 
-## What's next (TODO on cluster)
-
-### Required for a real text-to-motion training run
-
-| # | Task | Where |
-|---|---|---|
-| 1 | Wire HumanML3D dataset into the AR training loop | `moscale/dataset/humanml3d_dataset.py` already loads motion + text; just needs an AR-specific collator that handles fixed-length T=196 padding |
-| 2 | Add T5 text cross-attention to `SkelVQAR` | Pull from `moscale/model/transformer/moscale.py:200-220` (text_emb, text_norm, text_proj) and `transformer_helper.py:AdaLNSelfAttn(use_crossattn=True)`. Add to each `_Block`. |
-| 3 | Classifier-free guidance | Training: drop text condition with prob `cond_drop_prob` (replace with learned `cfg_uncond` embedding). Inference: sample with `logits = cfg_scale * logits_cond + (1 - cfg_scale) * logits_uncond`. Reference: `moscale.py:485-498`. |
-| 4 | Inference: scale-by-scale sampling decoder | Mirror `Infinity.autoregressive_infer_cfg` in `infinity.py:480-660`. At each scale: get logits → reshape `(B, L, D, V)` → top-k/top-p sample per channel → `indices_to_codes` → upsample → accumulate residual → feed to next scale. |
-| 5 | Training launcher + config | New file `moscale/train_skelvq_ar.py` patterned on `train_moscale.py`. New config `moscale/config/train_skelvq_ar.yaml` with `vq_ckpt`, `noise_apply_*`, `cond_drop_prob`, etc. |
-| 6 | Eval script | `moscale/eval_skelvq_ar.py` — generate text-conditioned motions, decode via SkelVQ wrapper, compute FID-on-generation. Mirror `eval_moscale.py`. |
-
-### Optional (nice-to-have parity)
+## What's optional / not yet done
 
 | # | Task |
 |---|---|
-| 7 | KV cache for inference (Infinity's `infer_use_kvcache`). |
-| 8 | BERT-style mask augmentation (MoScale's parallel-prediction trick from `moscale.py:519-549`) — improves sample quality but isn't required for a working AR. |
-| 9 | AdaLN conditioner (replaces our plain `LayerNorm` in `_Block`). |
+| 1 | KV cache at inference (`infer_use_kvcache=True` would speed up `generate()` substantially; the path exists in `moscale.py` but isn't yet wired into the FSQ generate). |
+| 2 | BERT-style mask augmentation (MoScale's parallel-prediction trick) — *intentionally* removed for stage 2; can be added back via `moscale.py` codepath if pure AR underperforms. |
+| 3 | LSC (`LevelSelfCorrection`) plumbed into `MoScaleFSQ.preprocess_motion_for_training` — currently only the minimal `SkelVQAR` path uses LSC. |
+| 4 | Variable-length training (current loader is window-based with all positions valid). |
+| 5 | KIT support — option exists but not exercised. |
 
 ## Critical gotchas already handled
 
@@ -98,12 +111,19 @@ MoScale-plusplus-dev/
 │   └── download_checkpoints.py                     # pull ckpts <- HF
 ├── models/vae/bsq.py                               # +85 lines: encode_indices, indices_to_codes, effective_levels
 ├── test_skelvq_fsq_indices.py                      # bsq.py + ckpt smoke tests
+├── data/t2m_caption_dataset.py                     # caption-aware HumanML3D loader for the AR training
+├── train_skelvq_ar.py                              # text-to-motion AR training launcher (uses MoScaleFSQ)
+├── eval_skelvq_ar.py                               # generation FID + R-precision + Diversity eval
+├── options/skelvq_ar_option.py                     # CLI options for the AR launcher
+├── utils/__init__.py                               # makes SALAD's utils a regular package (resolution priority)
 └── moscale/
-    ├── test_skelvq_ar.py                           # end-to-end overfit smoke test (cluster start point)
+    ├── test_skelvq_ar.py                           # minimal-backbone single-batch overfit test
     └── model/
         ├── vq/skelvq_wrapper.py                    # HRVQVAE-shaped API around SkelVQ-FSQ
         ├── level_self_correction.py                # FSQ analogue of BitwiseSelfCorrection
-        └── transformer/skelvq_ar.py                # minimal next-scale AR for FSQ
+        └── transformer/
+            ├── moscale_fsq.py                      # ★ text-to-motion AR (MoScale fork; mask path removed)
+            └── skelvq_ar.py                        # minimal alternative backbone (no AdaLN/RoPE)
 ```
 
 Existing files untouched: SALAD's encoder/decoder (`models/vae/encdec.py`),
