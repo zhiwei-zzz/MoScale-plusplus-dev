@@ -29,10 +29,7 @@ from torch.utils.data import DataLoader
 from data.t2m_dataset import Text2MotionDatasetEval
 from models.t2m_eval_wrapper import EvaluatorModelWrapper
 from utils.get_opt import get_opt
-from utils.metrics import (
-    calculate_activation_statistics, calculate_diversity, calculate_frechet_distance,
-    calculate_R_precision, euclidean_distance_matrix,
-)
+from utils.skelvq_ar_eval import make_gen_func, evaluate_once, aggregate_repeats
 from utils.word_vectorizer import WordVectorizer
 
 from model.vq.skelvq_wrapper import SkelVQWrapper             # type: ignore
@@ -58,88 +55,10 @@ def parse_args():
     return p.parse_args()
 
 
-def make_gen_func(ar, vq_model, cond_scale, temperature, top_p, device):
-    """Returns a function gen_func((caption, motion, m_length)) -> (pred_motion, _).
-
-    pred_motion: (B, T, pose_dim) — generated and decoded via the wrapper.
-    Note: m_length here is at original-frame resolution. We pass it through.
-    """
-    @torch.no_grad()
-    def gen_func(batch):
-        caption, motion, m_length = batch
-        if not isinstance(caption, list):
-            caption = list(caption)
-        m_length = m_length.to(device, dtype=torch.long)
-        return_list = ar.generate(
-            caption, m_length, cond_scale=cond_scale,
-            temperature=temperature, top_p_thres=top_p, vq_model=vq_model,
-        )
-        # Replace any -1 padded indices with 0 before dequantizing.
-        return_list = [r.clamp(min=0) for r in return_list]
-        pred = vq_model.decode_from_indices(return_list)
-        return pred, None
-    return gen_func
-
-
-def evaluate_once(args, ar, vq_model, eval_loader, eval_wrapper, gen_func, repeat_id):
-    motion_annotation_list, motion_pred_list = [], []
-    motion_gt_list, motion_gen_list = [], []
-    R_precision_real = 0
-    R_precision = 0
-    matching_score_real = 0
-    matching_score_pred = 0
-    nb_sample = 0
-
-    for batch in eval_loader:
-        word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, token = batch
-        motion = motion.to(args.device, dtype=torch.float32)
-        m_length = m_length.to(args.device, dtype=torch.long)
-        bs = motion.shape[0]
-
-        # Real motion side
-        motion_gt_list.append(motion)
-        et, em = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, motion, m_length)
-        R_precision_real += calculate_R_precision(et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
-        matching_score_real += euclidean_distance_matrix(et.cpu().numpy(), em.cpu().numpy()).trace()
-
-        # Generated motion side
-        pred_pose_eval, _ = gen_func((caption, motion, m_length))
-        mask = torch.arange(motion.shape[1]).unsqueeze(0).expand(motion.shape[0], -1).to(args.device) >= m_length.unsqueeze(1)
-        pred_pose_eval = pred_pose_eval.masked_fill(mask.unsqueeze(-1), 0)
-        motion_gen_list.append(pred_pose_eval)
-        et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_pose_eval, m_length)
-
-        motion_pred_list.append(em_pred)
-        motion_annotation_list.append(em)
-        R_precision += calculate_R_precision(et_pred.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
-        matching_score_pred += euclidean_distance_matrix(et_pred.cpu().numpy(), em_pred.cpu().numpy()).trace()
-
-        nb_sample += bs
-
-    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
-    motion_pred_np = torch.cat(motion_pred_list, dim=0).cpu().numpy()
-
-    gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
-    mu, cov = calculate_activation_statistics(motion_pred_np)
-
-    diversity_real = calculate_diversity(motion_annotation_np, 300 if nb_sample > 300 else 100)
-    diversity = calculate_diversity(motion_pred_np, 300 if nb_sample > 300 else 100)
-
-    R_precision_real = R_precision_real / nb_sample
-    R_precision = R_precision / nb_sample
-    matching_score_real = matching_score_real / nb_sample
-    matching_score_pred = matching_score_pred / nb_sample
-    fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
-
-    msg = (
-        f"[repeat {repeat_id}] FID {fid:.4f}  Div {diversity:.4f}  "
-        f"R@1/2/3 {R_precision[0]:.4f}/{R_precision[1]:.4f}/{R_precision[2]:.4f}  "
-        f"Match {matching_score_pred:.4f}"
-    )
-    print(msg)
-    return dict(fid=fid, diversity=diversity, top1=R_precision[0], top2=R_precision[1],
-                top3=R_precision[2], matching=matching_score_pred,
-                diversity_real=diversity_real, matching_real=matching_score_real)
+# Shared helpers `make_gen_func`, `evaluate_once`, and `aggregate_repeats`
+# now live in utils/skelvq_ar_eval.py and are also called from
+# train_skelvq_ar.py for periodic in-training gen-eval. Keeps the eval logic
+# in one place.
 
 
 def main():
@@ -194,20 +113,23 @@ def main():
 
     gen_func = make_gen_func(ar, vq_model, args.cond_scale, args.temperature, args.top_p, args.device)
 
-    # Repeat
-    metrics = {k: [] for k in ["fid", "diversity", "top1", "top2", "top3", "matching"]}
+    runs = []
     for r in range(args.repeat_times):
-        out = evaluate_once(args, ar, vq_model, eval_loader, eval_wrapper, gen_func, r)
-        for k in metrics:
-            metrics[k].append(out[k])
+        out = evaluate_once(ar, vq_model, eval_loader, eval_wrapper, gen_func, args.device)
+        msg = (
+            f"[repeat {r}] FID {out['fid']:.4f}  Div {out['diversity']:.4f}  "
+            f"R@1/2/3 {out['top1']:.4f}/{out['top2']:.4f}/{out['top3']:.4f}  "
+            f"Match {out['matching']:.4f}"
+        )
+        print(msg)
+        runs.append(out)
 
-    # Aggregate
+    # Aggregate (mean ± 95% CI per metric)
+    agg = aggregate_repeats(runs)
     print()
     print(f"=== {args.name} | cfg_scale={args.cond_scale} top_p={args.top_p} | {args.repeat_times} repeats ===")
-    for k, vs in metrics.items():
-        a = np.array(vs)
-        ci = a.std() * 1.96 / np.sqrt(len(a))
-        print(f"  {k}: {a.mean():.4f} ± {ci:.4f}")
+    for k in ("fid", "diversity", "top1", "top2", "top3", "matching"):
+        print(f"  {k}: {agg[k]:.4f} ± {agg[f'{k}_conf95']:.4f}")
 
 
 if __name__ == "__main__":

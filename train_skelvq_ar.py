@@ -29,11 +29,14 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-from data.t2m_dataset import MotionDataset
+from data.t2m_dataset import MotionDataset, Text2MotionDatasetEval
 from data.t2m_caption_dataset import Text2MotionWindowDataset, collate_fn as caption_collate
 from utils.get_opt import get_opt
 from utils.utils import print_current_loss
+from utils.skelvq_ar_eval import make_gen_func, evaluate_once, aggregate_repeats
 from models.vae.wandb_helper import make_logger
+from models.t2m_eval_wrapper import EvaluatorModelWrapper
+from utils.word_vectorizer import WordVectorizer
 
 from options.skelvq_ar_option import arg_parse
 
@@ -43,6 +46,29 @@ from model.transformer.moscale_fsq import MoScaleFSQ          # type: ignore
 
 def def_value():
     return 0.0
+
+
+def build_gen_eval(opt, vq_model_device):
+    """Set up the SALAD generation-quality evaluator bundle. Heavy (loads
+    SALAD's evaluator weights + GloVe + a separate Text2MotionDatasetEval),
+    so we instantiate once and reuse every fid_every_e epochs.
+
+    Returns: (eval_loader, eval_wrapper) or None if --fid_every_e <= 0.
+    """
+    if opt.fid_every_e <= 0:
+        return None
+    print(f"Setting up generation-quality evaluator (fid_every_e={opt.fid_every_e})")
+    wrapper_opt = get_opt(opt.dataset_opt_path, vq_model_device)
+    mean = np.load(pjoin(wrapper_opt.meta_dir, "mean.npy"))
+    std = np.load(pjoin(wrapper_opt.meta_dir, "std.npy"))
+    val_split = pjoin(opt.data_root, "val.txt")
+    w_vec = WordVectorizer(opt.glove_dir, "our_vab")
+    eval_ds = Text2MotionDatasetEval(wrapper_opt, mean, std, val_split, w_vec)
+    eval_loader = DataLoader(eval_ds, batch_size=opt.batch_size, shuffle=False,
+                             num_workers=opt.num_workers, drop_last=False, pin_memory=True)
+    eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+    print(f"  eval set: {len(eval_ds)} samples")
+    return eval_loader, eval_wrapper
 
 
 def build_dataset(opt):
@@ -137,6 +163,9 @@ def main():
     vq_model = SkelVQWrapper(opt.tokenizer_ckpt, device=str(opt.device))
     print(f"  J_b={vq_model.J_b}  effective_levels={vq_model.effective_levels}  scales={vq_model.scales}")
 
+    # ----- (optional) generation-quality evaluator bundle
+    gen_eval_bundle = build_gen_eval(opt, opt.device)
+
     # ----- AR
     cfg = build_cfg(opt)
     full_length = (opt.window_size // (2 ** vq_model.n_layers)) * vq_model.J_b
@@ -176,6 +205,7 @@ def main():
     print(f"Total epochs: {opt.max_epoch}  iters/epoch: {len(train_loader)}  total iters: {total_iters}")
 
     best_val = float("inf")
+    best_fid = float("inf")
     logs = defaultdict(def_value, OrderedDict())
 
     # ----- train loop
@@ -247,6 +277,40 @@ def main():
                             "opt": vars(opt)},
                            pjoin(opt.model_dir, "net_best_loss.tar"))
                 print(f"  new best val loss {val_loss:.4f}")
+
+        # ----- periodic generation-quality eval (FID + R-precision + Diversity)
+        if gen_eval_bundle is not None and epoch % opt.fid_every_e == 0:
+            eval_loader, eval_wrapper = gen_eval_bundle
+            gen_func = make_gen_func(
+                ar, vq_model,
+                cond_scale=opt.fid_cond_scale,
+                temperature=opt.fid_temperature,
+                top_p=opt.fid_top_p,
+                device=str(opt.device),
+            )
+            metric_runs = []
+            for r in range(opt.fid_repeat_times):
+                m = evaluate_once(ar, vq_model, eval_loader, eval_wrapper, gen_func, str(opt.device))
+                metric_runs.append(m)
+            agg = aggregate_repeats(metric_runs)
+            ar.train(True)
+            msg = (
+                f"[gen-eval] ep {epoch}  "
+                f"FID {agg['fid']:.4f}±{agg.get('fid_conf95', 0):.4f}  "
+                f"top1 {agg['top1']:.4f}  top2 {agg['top2']:.4f}  top3 {agg['top3']:.4f}  "
+                f"Div {agg['diversity']:.3f} (real {agg['diversity_real']:.3f})  "
+                f"Match {agg['matching']:.3f}"
+            )
+            print(msg)
+            for k, v in agg.items():
+                if not k.endswith("_conf95"):
+                    logger.add_scalar(f"GenEval/{k}", v, it)
+            if agg["fid"] < best_fid:
+                best_fid = agg["fid"]
+                torch.save({"ar": ar.state_dict(), "epoch": epoch, "fid": best_fid,
+                            "opt": vars(opt)},
+                           pjoin(opt.model_dir, "net_best_fid.tar"))
+                print(f"  new best FID {best_fid:.4f}")
 
 
 if __name__ == "__main__":

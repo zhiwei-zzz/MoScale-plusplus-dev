@@ -82,8 +82,24 @@ def arg_parse(is_train=False):
     p.add_argument("--checkpoints_dir", type=str, default="./checkpoints")
     p.add_argument("--log_every", default=10, type=int)
     p.add_argument("--save_latest", default=500, type=int)
-    p.add_argument("--eval_every_e", default=1, type=int)
+    p.add_argument("--eval_every_e", default=1, type=int,
+                   help="Cheap CE+acc validation cadence (epochs).")
     p.add_argument("--is_continue", action="store_true")
+
+    # periodic generation-quality eval (FID + R-precision + Diversity)
+    p.add_argument("--fid_every_e", default=-1, type=int,
+                   help="Run a full SALAD-evaluator generation-quality eval every "
+                        "N epochs. -1 disables. ~1-2 min/repeat on a 3090, plus the "
+                        "one-time evaluator + word-vectorizer load (~10 s).")
+    p.add_argument("--fid_repeat_times", default=1, type=int,
+                   help="Repeat count for the in-training gen eval. Use 1 for cheap, "
+                        "20 for the full paper protocol (use eval_skelvq_ar.py for that).")
+    p.add_argument("--fid_cond_scale", default=4.0, type=float,
+                   help="Classifier-free guidance scale at gen-eval time.")
+    p.add_argument("--fid_top_p", default=0.9, type=float)
+    p.add_argument("--fid_temperature", default=1.0, type=float)
+    p.add_argument("--glove_dir", default="./glove",
+                   help="GloVe embeddings dir (downloaded by prepare/download_glove.sh).")
 
     # wandb (optional; mirrors TensorBoard scalars when enabled)
     p.add_argument("--use_wandb", action="store_true")
