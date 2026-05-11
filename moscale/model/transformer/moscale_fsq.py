@@ -672,7 +672,13 @@ class MoScaleFSQ(nn.Module):
     @eval_decorator
     def generate(self, conds, m_lens, cond_scale,
                  temperature=1, top_p_thres=0.9,
-                 vq_model=None, sample_time=None):
+                 vq_model=None, sample_time=None,
+                 gt_prefix_indices=None, gt_prefix_count=0):
+        # DIAGNOSTIC: gt_prefix_indices is an optional list of (B, L_s, D) int64
+        # GT indices per scale. If supplied with gt_prefix_count > 0, the first
+        # `gt_prefix_count` scales use GT indices instead of AR samples (the
+        # cascade then continues with AR sampling). This localizes per-scale
+        # cascade drift without changing any training behaviour.
 
         if sample_time is not None:
             self.sample_level_times = sample_time
@@ -784,9 +790,20 @@ class MoScaleFSQ(nn.Module):
             )[:, :, 0]
             idx_BlD = sampled.reshape(B, pl, self.code_dim)               # (B, pl, code_dim)
 
-            # Mark padded positions as -1 in the returned indices.
+            # DIAGNOSTIC override: replace AR sample with GT for the first
+            # `gt_prefix_count` scales. Cascade continues from the GT-driven
+            # f_hat for subsequent (still-sampled) scales.
+            if gt_prefix_indices is not None and i < gt_prefix_count:
+                idx_BlD = gt_prefix_indices[i].to(idx_BlD.device).to(idx_BlD.dtype)
+
             cur_pad = ~non_pad_mask[i]
-            idx_BlD = torch.where(cur_pad.unsqueeze(-1).expand_as(idx_BlD), -1, idx_BlD)
+            # NOTE: do NOT overwrite padded positions with -1 in return_list.
+            # decode_from_indices treats every entry as a valid FSQ idx;
+            # injecting -1 (and then clamping to 0 downstream) yields code
+            # (0-half)/half ≈ -0.86 per channel which the conv decoder bleeds
+            # into the boundary of the real motion (huge FID regression).
+            # Caller is responsible for masking pred_motion past m_length
+            # (evaluate_once already does this).
             return_list.append(idx_BlD)
 
             # Convert the sampled indices to continuous codes for the residual cascade.

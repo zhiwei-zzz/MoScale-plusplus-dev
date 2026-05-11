@@ -52,6 +52,12 @@ def parse_args():
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--repeat_times", type=int, default=20)
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--teacher_force", action="store_true",
+                   help="DIAGNOSTIC: bypass MoScaleFSQ.generate; encode the real "
+                        "motion with the frozen tokenizer and decode_from_indices "
+                        "the GT indices. FID should match the tokenizer's standalone "
+                        "FID (~0.008 for skelvq_fsq). Any large gap localizes the bug "
+                        "to the encode/decode bridge in the AR eval path, not sampling.")
     return p.parse_args()
 
 
@@ -114,7 +120,21 @@ def main():
                              collate_fn=eval_collate)
     eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
 
-    gen_func = make_gen_func(ar, vq_model, args.cond_scale, args.temperature, args.top_p, args.device)
+    if args.teacher_force:
+        # Diagnostic: bypass the AR entirely; encode real motion -> GT indices ->
+        # decode_from_indices. Same encode/decode path the AR generation uses
+        # at inference, but with ground-truth indices instead of sampled ones.
+        @torch.no_grad()
+        def gen_func(batch):
+            _caption, motion, m_length = batch
+            motion = motion.to(args.device, dtype=torch.float32)
+            idx_list, _, _ = vq_model.encode(motion, m_lens=m_length, train=False)
+            idx_list = [r.clamp(min=0) for r in idx_list]
+            pred = vq_model.decode_from_indices(idx_list)
+            return pred, None
+        print("[teacher_force] gen_func = vq.encode(motion) -> vq.decode_from_indices")
+    else:
+        gen_func = make_gen_func(ar, vq_model, args.cond_scale, args.temperature, args.top_p, args.device)
 
     runs = []
     for r in range(args.repeat_times):
