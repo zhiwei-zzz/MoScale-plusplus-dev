@@ -39,10 +39,12 @@ def make_gen_func(ar, vq_model, cond_scale: float, temperature: float, top_p: fl
             temperature=temperature, top_p_thres=top_p, vq_model=vq_model,
         )
         return_list = [r.clamp(min=0) for r in return_list]
-        # Pass m_length so decode_from_indices zeros the bottleneck past
-        # bottleneck_lens(m_length) — mirrors SALAD VAE's pre-decoder masking
-        # and prevents AR-sampled garbage codes at trailing cells from leaking
-        # back into the valid-motion region via the conv decoder's receptive field.
+        # decode_from_indices runs the SALAD decoder over the full padded
+        # bottleneck WITHOUT m_lens-based masking — matches SALAD's own VAE,
+        # which decodes the full padded length and lets eval-time post-decoder
+        # masking (`pred_motion.masked_fill(..., 0)` below in evaluate_once)
+        # be the single masking point. m_length is still passed positionally
+        # for API consistency but is a no-op inside the wrapper.
         pred = vq_model.decode_from_indices(return_list, m_lens=m_length)
         return pred, None
     return gen_func

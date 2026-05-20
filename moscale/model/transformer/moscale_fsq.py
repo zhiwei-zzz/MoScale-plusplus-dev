@@ -482,52 +482,25 @@ class MoScaleFSQ(nn.Module):
             train=train,
         )
 
-        # Variable-length: per-scale boolean mask `(B, L_s)` — True at valid
-        # positions, False at positions beyond the sample's bottleneck-space
-        # length. For fixed-length training (all m_lens equal), this is all-True.
-        # Per-scale L_s is inferred from id_list[s] (which already has the right
-        # shape from MultiScaleFSQ.encode_indices), and per-sample valid lengths
-        # come from wrapper.compute_bottleneck_lens(m_lens) // scale.
-        non_pad_mask = []
-        if hasattr(vq_model, "compute_bottleneck_lens") and m_lens is not None:
-            bottleneck_lens = vq_model.compute_bottleneck_lens(m_lens.to(id_list[0].device))
-        else:
-            bottleneck_lens = None
-        for scale, ele in zip(self.scales, id_list):
-            B, L_s, _D = ele.shape
-            if bottleneck_lens is None:
-                non_pad_mask.append(torch.ones(B, L_s, dtype=torch.bool, device=ele.device))
-            else:
-                ds_mlens = (bottleneck_lens // scale).clamp(min=1, max=L_s).long()
-                non_pad_mask.append(lengths_to_mask(ds_mlens, L_s))
-
-        # `labels` for FSQ is (B, L_total, code_dim) — concatenate per-scale (B, L_s, D) along L.
-        # Set padded positions to -1 across all D channels so the forward()'s
-        # `(labels == -1).all(dim=-1)` padded-position check (and CE
-        # ignore_index=-100 path) treat them correctly.
-        masked_id_list = []
-        for ele, mask in zip(id_list, non_pad_mask):
-            ele = ele.clone()
-            ele[~mask] = -1
-            masked_id_list.append(ele)
-        labels = torch.cat(masked_id_list, dim=1)
-
-        # Cumulative partial-reconstruction stream: each scale's q_cum is at full L.
-        # We use raw_features[i] downsampled to the *next* scale's patch_size.
+        # SALAD-aligned pattern: no per-position masking anywhere in the AR /
+        # cascade pipeline. The SALAD encoder/decoder run over the full padded
+        # length without m_lens-awareness, so the AR also processes every
+        # position as a real one. Labels at trailing cells are whatever FSQ
+        # codes the (frozen) tokenizer produces from encoder-on-zero-padded
+        # input — deterministic given the encoder, trivial to fit, doesn't
+        # corrupt the model's text-to-motion learning. The only masking the
+        # pipeline does is post-decoder zeroing of pred_motion past m_length,
+        # which `evaluate_once` (and SALAD's eval_t2m) do before the BiGRU eval.
         #
-        # Zero out padded positions in raw_features BEFORE downsampling — same
-        # pattern SALAD's VAE uses on its quantized features pre-decoder. Without
-        # this, the encoder's outputs at zero-padded frames (which are arbitrary
-        # garbage values produced by the conv kernel folding zero pad) would feed
-        # into the AR's conditioning stream and pollute the area-pooled features
-        # for nearby valid cells.
-        if bottleneck_lens is not None:
-            full_L = raw_features[0].shape[-1]
-            valid_full_mask = lengths_to_mask(
-                bottleneck_lens.clamp(min=1, max=full_L).long(), full_L
-            )                                                 # (B, full_L) bool
-            mask_BCL = valid_full_mask.unsqueeze(1).float()    # (B, 1, full_L) for broadcast
-            raw_features = [rf * mask_BCL for rf in raw_features]
+        # `non_pad_mask` is kept all-True here so downstream call sites that
+        # consume it (forward's CE, generate's f_hat cascade) reduce to no-op
+        # masking. This is the explicit "match SALAD's no-masking" choice.
+        non_pad_mask = [
+            torch.ones(ele.shape[0], ele.shape[1], dtype=torch.bool, device=ele.device)
+            for ele in id_list
+        ]
+
+        labels = torch.cat(id_list, dim=1)
 
         downsampled_feature_list = []
         for i in range(len(self.patch_sizes) - 1):
@@ -683,28 +656,22 @@ class MoScaleFSQ(nn.Module):
         if sample_time is not None:
             self.sample_level_times = sample_time
 
-        # BUG-FIX (2026-05): the previous version did
-        #   lengths_to_mask((m_lens//scale).long(), full_length//scale)
-        # which treats m_lens as if it were in bottleneck-cell units. But the
-        # AR's full_length is `(window/4) * J_b` cells (e.g. 343 = 49*7), while
-        # m_lens is supplied by the caller in original-frame units (e.g. 196).
-        # The * J_b factor was missing on the LHS, so at inference the mask
-        # was 1/J_b = 1/7 fraction too short → only ~57% of cells got generated
-        # for a full-length motion, the rest got zero-masked. That's the
-        # train↔inference unit mismatch (training uses
-        # compute_bottleneck_lens(m_lens) = (m_lens/4)*7 already, so its masks
-        # were correct).
-        bottleneck_lens = vq_model.compute_bottleneck_lens(m_lens)
-        non_pad_mask = []
-        for scale in self.scales:
-            L_s = int(self.full_length // scale)
-            non_pad_mask.append(
-                lengths_to_mask(
-                    (bottleneck_lens // scale).clamp(min=1, max=L_s).long(),
-                    L_s,
-                )
-            )
-
+        # SALAD-aligned pattern: no per-position masking inside the AR.
+        # We still build a non_pad_mask list of all-True tensors so the
+        # f_hat cascade's existing call to get_next_autoregressive_input
+        # (which multiplies by non_pad_mask[si]) becomes a no-op. m_lens is
+        # carried through the API for backward compatibility but doesn't
+        # affect per-position behavior inside generate; it's used only by
+        # the caller (evaluate_once) to zero pred_motion past m_length
+        # before passing to the BiGRU eval — same one masking point SALAD
+        # itself does in eval_t2m.py.
+        B_local = m_lens.shape[0] if hasattr(m_lens, "shape") else len(m_lens)
+        device = m_lens.device if hasattr(m_lens, "device") else self.device
+        non_pad_mask = [
+            torch.ones(B_local, int(self.full_length // scale),
+                       dtype=torch.bool, device=device)
+            for scale in self.scales
+        ]
         non_pad_mask_stack = torch.cat(non_pad_mask, dim=1).repeat(2, 1)  # [2*B, L]
 
         # first get the text conditions; FOR CFG (Classifier Freee Guidance)

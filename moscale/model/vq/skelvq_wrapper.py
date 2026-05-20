@@ -349,16 +349,16 @@ class SkelVQWrapper(nn.Module):
         """Reconstruct motion from per-scale FSQ indices.
 
         idx_list[s]: (B, L_s, code_dim) int in [0, effective_levels).
-        m_lens:      optional (B,) int tensor with each sample's original-frame
-                     motion length. When provided, the assembled bottleneck
-                     ``z_cum`` is zeroed past ``compute_bottleneck_lens(m_lens)``
-                     before calling the SALAD decoder — mirrors how SALAD's
-                     own VAE pre-decoder masks padded positions (model.py).
-                     Without this, AR-sampled "garbage" codes past
-                     bottleneck_lens get fed into the decoder, and the conv
-                     kernels (kernel_size=3, n_layers=2 → receptive field
-                     ~12 frames) bleed them back into the boundary of the
-                     real motion region.
+        m_lens:      kept in signature for backward compatibility; **no longer
+                     used to mask the bottleneck.** Aligning with SALAD's own
+                     VAE which decodes the full padded bottleneck without
+                     masking — the decoder was trained on encoder outputs at
+                     every cell (no padding semantics), so feeding it a
+                     hard-zero trailing region is just as out-of-distribution
+                     as feeding it AR-sampled codes. The pipeline now matches
+                     SALAD's policy of "no masking inside enc/dec; mask only
+                     post-decoder pred_motion past m_length" (which
+                     evaluate_once does before the BiGRU eval).
         Returns motion of shape (B, T, pose_dim).
         """
         assert len(idx_list) == len(self.scales)
@@ -374,17 +374,6 @@ class SkelVQWrapper(nn.Module):
                 q_up = q_native
             z_cum = z_cum + q_up
 
-        # Mask the bottleneck past bottleneck_lens before decoding (SALAD VAE pattern).
-        # Prevents AR-sampled garbage codes at trailing positions from bleeding back
-        # into the boundary of the real motion via the decoder's conv receptive field.
-        if m_lens is not None:
-            from model.transformer.tools import lengths_to_mask  # type: ignore
-            bottleneck_lens = self.compute_bottleneck_lens(
-                m_lens.to(finest.device).long()
-            )
-            valid_mask = lengths_to_mask(
-                bottleneck_lens.clamp(min=1, max=L), L,
-            )                                   # (B, L) bool
-            z_cum = z_cum * valid_mask.unsqueeze(1).float()  # broadcast across D
-
+        # No m_lens-based bottleneck masking — see docstring. SALAD's own
+        # VAE does not mask before its decoder; we match that policy.
         return self.decode(z_cum)
