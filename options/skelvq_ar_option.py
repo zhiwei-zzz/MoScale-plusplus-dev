@@ -71,8 +71,11 @@ def arg_parse(is_train=False):
     # MoScale's HRVQVAE setting.
     p.add_argument("--perturb_lo", type=float, default=0.0,
                    help="lower bound of the per-step perturbation rate")
-    p.add_argument("--perturb_hi", type=float, default=0.6,
-                   help="upper bound of the per-step perturbation rate. Set 0 to disable.")
+    p.add_argument("--perturb_hi", type=float, default=0.1,
+                   help="upper bound of the per-step perturbation rate. Set 0 to disable. "
+                        "Empirically the sweet spot is ~0.1 for our FSQ tokenizer (best FID 1.38 "
+                        "vs 1.63 at 0; vs 15.87 at 0.6); see the perturb-rate ablation summary "
+                        "in STAGE2_STATUS.md / wandb zhiwei-z/moscale-plusplus.")
 
     # (legacy LSC knobs, unused by MoScaleFSQ but kept for the minimal
     # SkelVQAR backbone)
