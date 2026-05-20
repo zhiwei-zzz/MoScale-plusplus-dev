@@ -84,13 +84,19 @@ def arg_parse(is_train=False):
     p.add_argument("--noise_apply_requant", action="store_true", default=True)
 
     # optimization
-    p.add_argument("--max_epoch", default=200, type=int)
-    p.add_argument("--warm_up_iter", default=2000, type=int)
+    p.add_argument("--max_epoch", default=120, type=int)
+    p.add_argument("--warm_up_iter", default=2000, type=int,
+                   help="LR warmup is kept iteration-based (linear ramp during the first N iters)")
     p.add_argument("--lr", default=3e-4, type=float)
     p.add_argument("--weight_decay", default=0.05, type=float)
     p.add_argument("--grad_clip", default=2.0, type=float)
-    p.add_argument("--milestones", default=[150_000, 250_000], nargs="+", type=int)
-    p.add_argument("--gamma", default=0.05, type=float)
+    p.add_argument("--milestones", default=[60, 90], nargs="+", type=int,
+                   help="Epochs at which the MultiStepLR scheduler drops LR by --gamma. "
+                        "Default [60, 90] of 120 epochs = drop at 50%% and 75%% of training. "
+                        "(NOTE: was iteration-based previously; switched to epoch-based — "
+                        "the old defaults [150_000, 250_000] iters barely fired in a 120-epoch run.)")
+    p.add_argument("--gamma", default=0.05, type=float,
+                   help="LR multiplier at each milestone. Default 0.05 = drop by 20x.")
 
     # logging / checkpoints
     p.add_argument("--checkpoints_dir", type=str, default="./checkpoints")

@@ -300,8 +300,10 @@ def main():
             grad_norm = torch.nn.utils.clip_grad_norm_(ar.parameters(), opt.grad_clip)
             optim.step()
 
-            if it >= opt.warm_up_iter:
-                scheduler.step()
+            # MultiStepLR is stepped once per epoch (after the inner loop) — see
+            # below. Warmup is still iteration-based and handled by the explicit
+            # LR override above; once warmup is done the LR settles at base_lr
+            # until the first epoch milestone fires.
 
             logs["loss"] += loss.item()
             logs["lr"] += optim.param_groups[0]["lr"]
@@ -335,6 +337,16 @@ def main():
                    pjoin(opt.model_dir, "latest.tar"))
 
         epoch += 1
+
+        # Epoch-based MultiStepLR step. Drops LR by --gamma at each epoch in
+        # --milestones (defaults [60, 90] of 120). PyTorch's last_epoch counter
+        # is incremented here; warmup ran iteration-wise during epoch 0 (and
+        # possibly epoch 1 if warm_up_iter > one epoch's iters) but doesn't
+        # interact with the scheduler — by the time we call step() at the end
+        # of epoch 0, warmup is done and LR is at base_lr.
+        scheduler.step()
+        logger.add_scalar("Train/lr_after_epoch", optim.param_groups[0]["lr"], it)
+
         if epoch % opt.eval_every_e == 0:
             val_loss, val_acc, val_ps_acc = run_validation(ar, vq_model, val_loader, opt.device, opt.text_cond)
             ps_str = "  ".join(f"{k}={v:.3f}" for k, v in val_ps_acc.items())
