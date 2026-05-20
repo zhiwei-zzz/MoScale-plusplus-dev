@@ -341,10 +341,24 @@ class SkelVQWrapper(nn.Module):
         return self.skelvq.decode(z_grid)
 
     @torch.no_grad()
-    def decode_from_indices(self, idx_list: List[torch.Tensor]) -> torch.Tensor:
+    def decode_from_indices(
+        self,
+        idx_list: List[torch.Tensor],
+        m_lens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Reconstruct motion from per-scale FSQ indices.
 
         idx_list[s]: (B, L_s, code_dim) int in [0, effective_levels).
+        m_lens:      optional (B,) int tensor with each sample's original-frame
+                     motion length. When provided, the assembled bottleneck
+                     ``z_cum`` is zeroed past ``compute_bottleneck_lens(m_lens)``
+                     before calling the SALAD decoder — mirrors how SALAD's
+                     own VAE pre-decoder masks padded positions (model.py).
+                     Without this, AR-sampled "garbage" codes past
+                     bottleneck_lens get fed into the decoder, and the conv
+                     kernels (kernel_size=3, n_layers=2 → receptive field
+                     ~12 frames) bleed them back into the boundary of the
+                     real motion region.
         Returns motion of shape (B, T, pose_dim).
         """
         assert len(idx_list) == len(self.scales)
@@ -359,4 +373,18 @@ class SkelVQWrapper(nn.Module):
             else:
                 q_up = q_native
             z_cum = z_cum + q_up
+
+        # Mask the bottleneck past bottleneck_lens before decoding (SALAD VAE pattern).
+        # Prevents AR-sampled garbage codes at trailing positions from bleeding back
+        # into the boundary of the real motion via the decoder's conv receptive field.
+        if m_lens is not None:
+            from model.transformer.tools import lengths_to_mask  # type: ignore
+            bottleneck_lens = self.compute_bottleneck_lens(
+                m_lens.to(finest.device).long()
+            )
+            valid_mask = lengths_to_mask(
+                bottleneck_lens.clamp(min=1, max=L), L,
+            )                                   # (B, L) bool
+            z_cum = z_cum * valid_mask.unsqueeze(1).float()  # broadcast across D
+
         return self.decode(z_cum)

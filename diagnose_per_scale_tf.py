@@ -129,9 +129,10 @@ def main():
                 gt_prefix_indices=gt_idx_list, gt_prefix_count=gt_prefix_count,
             )
             # ar.generate now returns raw indices at padded positions (no -1
-            # mask). decode_from_indices treats them as valid FSQ idx; the
-            # caller (evaluate_once) masks pred_motion past m_length.
-            pred = vq_model.decode_from_indices(return_list)
+            # mask). decode_from_indices(m_lens=...) zeros the bottleneck past
+            # bottleneck_lens before decoding to prevent the conv decoder
+            # leaking AR-sampled garbage at trailing cells into the valid region.
+            pred = vq_model.decode_from_indices(return_list, m_lens=m_length_dev)
             return pred, None
         return gen_func
 

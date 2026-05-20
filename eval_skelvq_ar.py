@@ -130,7 +130,7 @@ def main():
             motion = motion.to(args.device, dtype=torch.float32)
             idx_list, _, _ = vq_model.encode(motion, m_lens=m_length, train=False)
             idx_list = [r.clamp(min=0) for r in idx_list]
-            pred = vq_model.decode_from_indices(idx_list)
+            pred = vq_model.decode_from_indices(idx_list, m_lens=m_length)
             return pred, None
         print("[teacher_force] gen_func = vq.encode(motion) -> vq.decode_from_indices")
     else:

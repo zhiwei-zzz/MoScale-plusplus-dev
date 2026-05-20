@@ -39,7 +39,11 @@ def make_gen_func(ar, vq_model, cond_scale: float, temperature: float, top_p: fl
             temperature=temperature, top_p_thres=top_p, vq_model=vq_model,
         )
         return_list = [r.clamp(min=0) for r in return_list]
-        pred = vq_model.decode_from_indices(return_list)
+        # Pass m_length so decode_from_indices zeros the bottleneck past
+        # bottleneck_lens(m_length) — mirrors SALAD VAE's pre-decoder masking
+        # and prevents AR-sampled garbage codes at trailing cells from leaking
+        # back into the valid-motion region via the conv decoder's receptive field.
+        pred = vq_model.decode_from_indices(return_list, m_lens=m_length)
         return pred, None
     return gen_func
 
