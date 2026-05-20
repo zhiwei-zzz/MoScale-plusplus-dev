@@ -80,8 +80,13 @@ def main():
     ar_opt = ar_state.get("opt", None)
     if ar_opt is None:
         raise RuntimeError(f"AR checkpoint at {args.ar_ckpt} has no `opt` field; was it saved by train_skelvq_ar.py?")
+    # Respect saved head_latent_dim (may differ from latent_dim, e.g. MoScale
+    # config's 384/768 split). Falls back to latent_dim for ckpts trained
+    # before the --head_latent_dim CLI flag was added.
+    _hld = ar_opt.get("head_latent_dim", -1)
+    head_latent_dim = _hld if _hld > 0 else ar_opt["latent_dim"]
     cfg = OmegaConf.create({
-        "model": dict(latent_dim=ar_opt["latent_dim"], head_latent_dim=ar_opt["latent_dim"],
+        "model": dict(latent_dim=ar_opt["latent_dim"], head_latent_dim=head_latent_dim,
                       num_layers=ar_opt["num_layers"], n_heads=ar_opt["num_heads"],
                       mlp_ratio=ar_opt["mlp_ratio"], dropout=ar_opt["dropout"],
                       attn_drop_rate=0.0, use_crossattn=True, attn_l2_norm=False,
@@ -113,10 +118,15 @@ def main():
     w_vec = WordVectorizer(args.glove_dir, "our_vab")
     test_split = pjoin(args.data_root, "test.txt")
     eval_ds = Text2MotionDatasetEval(wrapper_opt, mean, std, test_split, w_vec)
-    # collate_fn sorts by sent_len desc — required by the SALAD/MoScale evaluator's
-    # pack_padded_sequence (enforce_sorted=True default). Mirrors upstream usage.
-    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=args.num_workers, drop_last=False, pin_memory=True,
+    # shuffle=True + drop_last=True is REQUIRED for a correct R-precision:
+    # Text2MotionDatasetEval sorts name_list by motion length, so an unshuffled
+    # batch is 32 near-identical-length motions, which collapses retrieval
+    # (real top1 ~0.38 instead of ~0.51). Random 32-pools + dropping the
+    # partial tail batch matches the canonical T2M protocol (see
+    # motion_loaders/dataset_motion_loader.py). collate_fn sorts by sent_len
+    # desc within the batch — required by the evaluator's pack_padded_sequence.
+    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=True,
+                             num_workers=args.num_workers, drop_last=True, pin_memory=True,
                              collate_fn=eval_collate)
     eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
 
@@ -142,16 +152,21 @@ def main():
         msg = (
             f"[repeat {r}] FID {out['fid']:.4f}  Div {out['diversity']:.4f}  "
             f"R@1/2/3 {out['top1']:.4f}/{out['top2']:.4f}/{out['top3']:.4f}  "
-            f"Match {out['matching']:.4f}"
+            f"Match {out['matching']:.4f}  "
+            f"|| REAL R@1/2/3 {out['top1_real']:.4f}/{out['top2_real']:.4f}/{out['top3_real']:.4f}  "
+            f"Match_real {out['matching_real']:.4f}  Div_real {out['diversity_real']:.4f}"
         )
         print(msg)
         runs.append(out)
 
-    # Aggregate (mean ± 95% CI per metric)
+    # Aggregate (mean ± 95% CI per metric). The *_real metrics are computed on
+    # ground-truth motion and should reproduce the evaluator's known baselines
+    # (real top1 ~0.51) — a sanity check that the eval pipeline is correct.
     agg = aggregate_repeats(runs)
     print()
     print(f"=== {args.name} | cfg_scale={args.cond_scale} top_p={args.top_p} | {args.repeat_times} repeats ===")
-    for k in ("fid", "diversity", "top1", "top2", "top3", "matching"):
+    for k in ("fid", "diversity", "top1", "top2", "top3", "matching",
+              "diversity_real", "top1_real", "top2_real", "top3_real", "matching_real"):
         print(f"  {k}: {agg[k]:.4f} ± {agg[f'{k}_conf95']:.4f}")
 
 

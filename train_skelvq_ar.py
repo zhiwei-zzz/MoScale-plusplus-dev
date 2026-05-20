@@ -70,12 +70,15 @@ def build_gen_eval(opt, vq_model_device):
     val_split = pjoin(opt.data_root, "val.txt")
     w_vec = WordVectorizer(opt.glove_dir, "our_vab")
     eval_ds = Text2MotionDatasetEval(wrapper_opt, mean, std, val_split, w_vec)
-    # collate_fn sorts by sent_len desc — required by the SALAD/MoScale evaluator's
-    # pack_padded_sequence which uses the default enforce_sorted=True. Mirrors how
-    # both upstream projects build their eval DataLoaders (motion_loaders/dataset_motion_loader.py
-    # and moscale/model/evaluator/hml/dataset_motion_loader.py).
-    eval_loader = DataLoader(eval_ds, batch_size=opt.batch_size, shuffle=False,
-                             num_workers=opt.num_workers, drop_last=False, pin_memory=True,
+    # shuffle=True + drop_last=True is REQUIRED for a correct R-precision:
+    # Text2MotionDatasetEval sorts name_list by motion length, so an unshuffled
+    # batch is 32 near-identical-length motions, which collapses retrieval
+    # (real top1 ~0.38 instead of ~0.51). Random 32-pools + dropping the
+    # partial tail batch matches the canonical T2M protocol (see
+    # motion_loaders/dataset_motion_loader.py). collate_fn sorts by sent_len
+    # desc within the batch — required by the evaluator's pack_padded_sequence.
+    eval_loader = DataLoader(eval_ds, batch_size=opt.batch_size, shuffle=True,
+                             num_workers=opt.num_workers, drop_last=True, pin_memory=True,
                              collate_fn=eval_collate)
     eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
     print(f"  eval set: {len(eval_ds)} samples")
