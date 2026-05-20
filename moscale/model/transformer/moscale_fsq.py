@@ -683,12 +683,28 @@ class MoScaleFSQ(nn.Module):
         if sample_time is not None:
             self.sample_level_times = sample_time
 
+        # BUG-FIX (2026-05): the previous version did
+        #   lengths_to_mask((m_lens//scale).long(), full_length//scale)
+        # which treats m_lens as if it were in bottleneck-cell units. But the
+        # AR's full_length is `(window/4) * J_b` cells (e.g. 343 = 49*7), while
+        # m_lens is supplied by the caller in original-frame units (e.g. 196).
+        # The * J_b factor was missing on the LHS, so at inference the mask
+        # was 1/J_b = 1/7 fraction too short → only ~57% of cells got generated
+        # for a full-length motion, the rest got zero-masked. That's the
+        # train↔inference unit mismatch (training uses
+        # compute_bottleneck_lens(m_lens) = (m_lens/4)*7 already, so its masks
+        # were correct).
+        bottleneck_lens = vq_model.compute_bottleneck_lens(m_lens)
         non_pad_mask = []
         for scale in self.scales:
+            L_s = int(self.full_length // scale)
             non_pad_mask.append(
-                lengths_to_mask((m_lens//scale).long(), int(self.full_length//scale))
+                lengths_to_mask(
+                    (bottleneck_lens // scale).clamp(min=1, max=L_s).long(),
+                    L_s,
+                )
             )
-        
+
         non_pad_mask_stack = torch.cat(non_pad_mask, dim=1).repeat(2, 1)  # [2*B, L]
 
         # first get the text conditions; FOR CFG (Classifier Freee Guidance)
