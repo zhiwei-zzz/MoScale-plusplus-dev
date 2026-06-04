@@ -269,13 +269,22 @@ class FSQ(nn.Module):
 
 
 class MultiScaleFSQ(nn.Module):
-    """Residual FSQ over a 1D temporal axis. Drop-in for MultiScaleBSQ.
+    """Residual FSQ over a 1D temporal axis (default) or a 2D (time × joints) grid.
 
-    Same residual loop as MultiScaleBSQ, only the per-scale quantizer changes:
+    Same residual loop as MultiScaleBSQ. Only the per-scale quantizer changes:
       r_s = downsample(residual, L/scale)
       q_s = FSQ(r_s)
       residual <- residual - upsample(q_s).detach()
       quantized_out += upsample(q_s)
+
+    ``cascade_mode``:
+      * ``"1d"`` (default, legacy): input ``(B, D, L)``. Per-scale downsample
+        of the flattened L axis by ``scale``.
+      * ``"2d"``: input ``(B, D, T, J)``. Per-scale temporal-only downsample
+        (J is preserved across scales). 2D ``area``/``bilinear`` interp.
+        Per-scale shapes: ``(B, D, T/scale, J)``. This matches ScaleMoGen's
+        skeletal-temporal token map layout when paired with RoPE2D on the AR
+        side (J fixed at 7 here; J subdivision-per-scale is out of scope).
 
     Effective level count for stage-2 AR (encode_indices / indices_to_codes):
       For L=8 setting, half=(L-1)/2=3.5; clamped reachable rounded ∈ {-3..3}, so
@@ -293,12 +302,15 @@ class MultiScaleFSQ(nn.Module):
         inv_temperature: float = 20.0,
         entropy_weight: float = 0.0,
         zeta: float = 1.0,
+        cascade_mode: str = "1d",
     ):
         super().__init__()
+        assert cascade_mode in ("1d", "2d"), f"cascade_mode must be '1d' or '2d', got {cascade_mode}"
         self.code_dim = code_dim
         self.scales = list(scales)
         self.levels = levels
         self.use_decay_factor = use_decay_factor
+        self.cascade_mode = cascade_mode
         self.fsq = FSQ(
             code_dim=code_dim,
             levels=levels,
@@ -316,6 +328,10 @@ class MultiScaleFSQ(nn.Module):
         quantize_dropout_prob: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         del temperature, m_lens, start_drop, quantize_dropout_prob
+
+        if self.cascade_mode == "2d":
+            return self._forward_2d(x)
+
         B, D, L = x.shape
         assert D == self.code_dim, f"expected D={self.code_dim}, got {D}"
 
@@ -353,6 +369,52 @@ class MultiScaleFSQ(nn.Module):
         avg_diag = torch.stack(diags).mean()
         return quantized_out, total_loss, avg_diag
 
+    def _forward_2d(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """2D cascade: input (B, D, T, J). Temporal-only downsample per scale; J preserved.
+
+        Per-scale interp uses 2D ``area`` for downsample and ``bilinear`` for upsample.
+        FSQ itself is per-channel and shape-agnostic — we reshape to (B, D, T_s*J),
+        quantize, reshape back to (B, D, T_s, J).
+        """
+        assert x.dim() == 4, f"2d cascade expects (B, D, T, J), got {tuple(x.shape)}"
+        B, D, T, J = x.shape
+        assert D == self.code_dim, f"expected D={self.code_dim}, got {D}"
+
+        residual = x
+        quantized_out = torch.zeros_like(x)
+        losses: list[torch.Tensor] = []
+        diags: list[torch.Tensor] = []
+        out_fact = 1.0
+
+        for si, scale in enumerate(self.scales):
+            T_s = max(1, T // scale) if scale > 1 else T
+            if T_s != T:
+                interp = F.interpolate(residual, size=(T_s, J), mode="area")  # (B, D, T_s, J)
+            else:
+                interp = residual
+
+            # FSQ on (B, D, T_s*J) then reshape back to 2D.
+            q_flat, loss, diag = self.fsq(interp.reshape(B, D, T_s * J))
+            q = q_flat.reshape(B, D, T_s, J)
+            if self.use_decay_factor:
+                q = q * max(0.1, out_fact)
+                out_fact -= 0.1
+
+            if T_s != T:
+                q_up = F.interpolate(q, size=(T, J), mode="bilinear", align_corners=False)
+            else:
+                q_up = q
+
+            residual = residual - q_up.detach()
+            quantized_out = quantized_out + q_up
+
+            losses.append(loss)
+            diags.append(diag)
+
+        total_loss = torch.stack(losses).sum()
+        avg_diag = torch.stack(diags).mean()
+        return quantized_out, total_loss, avg_diag
+
     @property
     def effective_levels(self) -> int:
         """Number of distinct discrete level indices per channel.
@@ -372,6 +434,100 @@ class MultiScaleFSQ(nn.Module):
         int_half = int(self.fsq.half)
         rounded = idx.to(dtype=torch.float32) - int_half
         return rounded / self.fsq.half
+
+    @torch.no_grad()
+    def encode_indices_2d(
+        self,
+        x: torch.Tensor,
+        perturb_rate=None,
+        train: bool = False,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        """2D-cascade encode_indices. Same semantics as ``encode_indices`` but
+        the cascade is built over a 2D temporal × joints grid with J preserved.
+
+        Args:
+          x: (B, D, T, J) — pre-quantize 2D features.
+
+        Returns three same-length lists, one entry per residual scale:
+          idx_per_scale[s]: (B, T_s * J, D) int64, level indices ∈ [0, eff_lvl).
+                             (Flat sequence layout for consumption by the AR;
+                              the (T_s, J) factorization is implicit and is
+                              what RoPE2D consumes.)
+          q_per_scale[s]:   (B, D, T_s, J) float — dequantized at native scale.
+          q_cum[s]:         (B, D, T, J)  float — cumulative dequantized after
+                             scale s, upsampled to full (T, J).
+        """
+        assert x.dim() == 4, f"2d encode_indices expects (B, D, T, J), got {tuple(x.shape)}"
+        B, D, T, J = x.shape
+        assert D == self.code_dim, f"expected D={self.code_dim}, got {D}"
+        int_half = int(self.fsq.half)
+        half = self.fsq.half
+        eff_lvl = 2 * int_half + 1
+
+        if perturb_rate is None:
+            lo = hi = 0.0
+        elif isinstance(perturb_rate, (int, float)):
+            lo, hi = 0.0, float(perturb_rate)
+        else:
+            lo, hi = float(perturb_rate[0]), float(perturb_rate[1])
+        do_perturb = train and hi > 0.0
+
+        residual = x
+        cum = torch.zeros_like(x)
+        idx_per_scale: list[torch.Tensor] = []
+        q_per_scale: list[torch.Tensor] = []
+        q_cum: list[torch.Tensor] = []
+
+        for scale in self.scales:
+            T_s = max(1, T // scale) if scale > 1 else T
+            if T_s != T:
+                interp = F.interpolate(residual, size=(T_s, J), mode="area")
+            else:
+                interp = residual
+
+            # Per-channel FSQ at this scale (clean GT indices).
+            # interp: (B, D, T_s, J) → reshape to (B, T_s*J, D) for per-channel tanh+round.
+            L_s = T_s * J
+            z_T = interp.reshape(B, D, L_s).transpose(1, 2).contiguous()  # (B, L_s, D)
+            bounded = half * torch.tanh(z_T)
+            rounded = torch.round(bounded).clamp(-int_half, int_half)
+            idx_gt = (rounded + int_half).to(dtype=torch.int64)            # (B, L_s, D)
+            idx_per_scale.append(idx_gt)
+
+            if do_perturb:
+                import random as _random
+                rate = _random.uniform(lo, hi)
+                if rate > 0:
+                    mask = torch.rand_like(idx_gt, dtype=torch.float32) < rate
+                    if mask.any():
+                        flat_true = idx_gt[mask]
+                        r = torch.randint(0, eff_lvl - 1, (flat_true.numel(),),
+                                          dtype=torch.int64, device=idx_gt.device)
+                        r = r + (r >= flat_true).to(torch.int64)
+                        idx_eff = idx_gt.clone()
+                        idx_eff[mask] = r
+                    else:
+                        idx_eff = idx_gt
+                else:
+                    idx_eff = idx_gt
+            else:
+                idx_eff = idx_gt
+
+            # Dequantize: (B, L_s, D) → continuous (B, L_s, D) → (B, D, T_s, J).
+            q_native_flat = self.indices_to_codes(idx_eff).permute(0, 2, 1).contiguous()  # (B, D, L_s)
+            q_native = q_native_flat.reshape(B, D, T_s, J)                                  # (B, D, T_s, J)
+            q_per_scale.append(q_native)
+
+            if T_s != T:
+                q_up = F.interpolate(q_native, size=(T, J), mode="bilinear", align_corners=False)
+            else:
+                q_up = q_native
+
+            residual = residual - q_up
+            cum = cum + q_up
+            q_cum.append(cum.clone())
+
+        return idx_per_scale, q_per_scale, q_cum
 
     @torch.no_grad()
     def encode_indices(

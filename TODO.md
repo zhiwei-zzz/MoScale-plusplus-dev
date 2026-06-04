@@ -70,6 +70,72 @@ Within-position attention has cost `O(B·L · 384²·d_ch) = O(B·641·150k·d_c
 
 ---
 
+## 4. 2D-cascade tokenizer + RoPE2D AR — ScaleMoGen port (Option A)
+
+ScaleMoGen (arxiv 2605.11704) reports FID 0.030 vs MoMask's 0.045 on HumanML3D
+by (a) arranging per-scale tokens as 2D (temporal × skeletal) grids instead of
+1D flattening, and (b) using RoPE2D over those grids. This is a direct test of
+whether the same wins apply to our FSQ tokenizer.
+
+**Scope** (Option A, "time-only downsampling"):
+- Per-scale token maps: `(T_s, J=7)` for T_s in `[6, 12, 24, 49]`. J fixed.
+- Per-scale token counts: `[42, 84, 168, 343]` (total 637, was 641).
+- Tokenizer cascade: 2D `area` downsample + `bilinear` upsample.
+- AR positional encoding: RoPE2D, head_dim split half→t, half→j.
+- J subdivision per scale (a la ScaleMoGen's skeletal partition) is deferred.
+
+**Code** (landed on `main`):
+- [x] `models/vae/bsq.py`: `MultiScaleFSQ` gains `cascade_mode={"1d","2d"}`;
+       new `_forward_2d` and `encode_indices_2d` methods.
+- [x] `models/vae/skel_vq.py`: when `quantizer_cascade="2d"`, passes
+       `(B, D, T_b, J_b)` to the FSQ directly (no flatten).
+- [x] `options/skel_vq_option.py`: `--quantizer_cascade {1d,2d}` flag.
+- [x] `moscale/model/transformer/moscale_fsq.py`: new
+       `precompute_rope2d_for_batch`; `MoScaleFSQ` reads
+       `cfg.model.use_rope2d`; `create_PE`, `preprocess_motion_for_training`,
+       `get_next_autoregressive_input`, and `generate` all branch on the flag.
+- [x] `moscale/model/vq/skelvq_wrapper.py`: auto-detects `cascade_mode` from
+       the sibling `opt.txt`; encode/decode-from-indices route to 2D paths.
+- [x] `options/skelvq_ar_option.py`: `--use_rope2d` flag.
+- [x] `train_skelvq_ar.py`: threads `use_rope2d`/`rope2d_J` into cfg; asserts
+       tokenizer-cascade vs AR-flag consistency at startup.
+
+**Feasibility checks** (passing locally):
+- [x] `scripts/feasibility_check_2d.py` (run from SALAD root): 2D FSQ
+       cascade shapes + gradients OK; SkelVQ end-to-end recon at 2D OK
+       (272/292 params with non-zero grad).
+- [x] `moscale/scripts/feasibility_check_2d_ar.py` (run from `moscale/`):
+       RoPE2D base tensor structure OK; MoScaleFSQ with `use_rope2d=True`
+       forward+backward OK (loss=1.946=ln(7), acc=0.142=1/7 at init — exactly
+       random-init baseline); generate produces `[(42,32), (84,32), (168,32),
+       (343,32)]` per-scale shapes.
+
+**Cluster handoff (still to do)**:
+- [ ] Retrain SkelVQ-FSQ tokenizer at 2D for the same 50-epoch budget:
+       ```
+       python train_skel_hrvqvae.py --name skelvq_fsq_2d \
+         --quantizer_type fsq --quantizer_cascade 2d \
+         <same hyperparams as the 1D ckpt>
+       ```
+       Estimated ~6h on a 3090. Acceptance: recon FID within 2× of the 1D
+       ckpt's 0.0071 (margin allows for the cascade-math change; tokenizer
+       isn't the bottleneck so this is a sanity floor, not a target).
+- [ ] Retrain MoScaleFSQ AR at 2D with the new tokenizer, same L=16/H=768 +
+       perturb=0.8 + scheduler config as `90ds465n`:
+       ```
+       python train_skelvq_ar.py --name skelvq_ar_l16_h768_perturb080_2d \
+         --use_rope2d --tokenizer_ckpt checkpoints/t2m/skelvq_fsq_2d/model/net_best_fid.tar \
+         <rest of 90ds465n config>
+       ```
+       Estimated ~30h. Acceptance: FID strictly better than `90ds465n`'s 0.40.
+       Target: ScaleMoGen's reported 0.030 ballpark.
+- [ ] If FID improves: keep 2D as the new baseline and re-run Tier 1 perturb
+       sweep + Tier 2 CFG scan on top. If it doesn't: investigate whether the
+       additional skeletal-partition piece from ScaleMoGen (Option B) is
+       carrying the wins, not the 2D arrangement alone.
+
+---
+
 ## Out of scope for now
 
 These came up in the discussion but are deferred until 1-3 are explored:

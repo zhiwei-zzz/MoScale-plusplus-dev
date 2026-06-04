@@ -79,6 +79,14 @@ def arg_parse(is_train=False):
                              "set ~0.1 to enable LFQ-style level-usage regularization)")
     parser.add_argument("--fsq_zeta", type=float, default=1.0,
                         help="fsq: scaling on the entropy term (mirrors BSQ)")
+    parser.add_argument("--quantizer_cascade", type=str, default="1d",
+                        choices=["1d", "2d"],
+                        help="fsq only. '1d' (legacy): flatten (T_b, J_b) -> L and run "
+                             "the residual FSQ on the 1D sequence. '2d' (ScaleMoGen-style): "
+                             "keep (T_b, J_b) structure and downsample only the temporal "
+                             "axis per scale (J preserved). Per-scale shapes become "
+                             "(T_b/scale, J_b). Pair with --use_rope2d on the AR side for "
+                             "an apples-to-apples 2D+RoPE2D run vs the 1D baseline.")
 
     # other
     parser.add_argument("--is_continue", action="store_true")

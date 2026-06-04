@@ -58,6 +58,7 @@ class SkelVQ(nn.Module):
                 use_decay_factor=False,
             )
         elif self.quantizer_type == "fsq":
+            self.cascade_mode = getattr(opt, "quantizer_cascade", "1d")
             self.quantizer = MultiScaleFSQ(
                 code_dim=opt.code_dim,
                 scales=self.scales,
@@ -66,6 +67,7 @@ class SkelVQ(nn.Module):
                 inv_temperature=getattr(opt, "fsq_inv_temperature", 20.0),
                 entropy_weight=getattr(opt, "fsq_entropy_weight", 0.0),
                 zeta=getattr(opt, "fsq_zeta", 1.0),
+                cascade_mode=self.cascade_mode,
             )
         else:
             raise ValueError(f"Unknown quantizer_type: {self.quantizer_type}")
@@ -100,29 +102,50 @@ class SkelVQ(nn.Module):
         B, T_b, J_b, D = h.shape
         L = T_b * J_b                     # number of cells per clip
 
-        # Reshape to (B, D, T_b*J_b) - joints major within each timestep, then advance time.
-        # This mirrors VAR's raster scan and gives the residual VQ a single 1D axis.
-        z_1d = h.reshape(B, T_b * J_b, D).transpose(1, 2).contiguous()  # (B, D, L)
+        # 2D-cascade path: pass (B, D, T_b, J_b) directly so the FSQ residual
+        # cascade can downsample the temporal axis while preserving the joint
+        # structure (matches ScaleMoGen's skeletal-temporal token map layout).
+        use_2d = self.quantizer_type == "fsq" and getattr(self, "cascade_mode", "1d") == "2d"
+        if use_2d:
+            z_2d = h.permute(0, 3, 1, 2).contiguous()  # (B, D, T_b, J_b)
+            if m_lens is None:
+                m_lens_q = torch.full((B,), L, dtype=torch.long, device=x.device)
+            else:
+                m_lens_q = (m_lens // (2 ** self.opt.n_layers)) * J_b
+                m_lens_q = m_lens_q.clamp(min=1, max=L).long()
 
-        # MSQuantizer.forward requires m_lens. With fixed-length training clips no padding
-        # is needed, so all L cells are valid.
-        if m_lens is None:
-            m_lens_q = torch.full((B,), L, dtype=torch.long, device=x.device)
+            z_q_2d, q_loss, q_diag = self.quantizer(
+                z_2d,
+                temperature=0.5,
+                m_lens=m_lens_q,
+                start_drop=getattr(self.opt, "start_drop", -1),
+                quantize_dropout_prob=getattr(self.opt, "quantize_dropout_prob", 0.0),
+            )                              # (B, D, T_b, J_b)
+            z_q_per_joint = z_q_2d.permute(0, 2, 3, 1).contiguous()  # (B, T_b, J_b, D)
         else:
-            # m_lens at the input resolution -> bottleneck cell count.
-            m_lens_q = (m_lens // (2 ** self.opt.n_layers)) * J_b
-            m_lens_q = m_lens_q.clamp(min=1, max=L).long()
+            # Reshape to (B, D, T_b*J_b) - joints major within each timestep, then advance time.
+            # This mirrors VAR's raster scan and gives the residual VQ a single 1D axis.
+            z_1d = h.reshape(B, T_b * J_b, D).transpose(1, 2).contiguous()  # (B, D, L)
 
-        z_q, q_loss, q_diag = self.quantizer(
-            z_1d,
-            temperature=0.5,
-            m_lens=m_lens_q,
-            start_drop=getattr(self.opt, "start_drop", -1),
-            quantize_dropout_prob=getattr(self.opt, "quantize_dropout_prob", 0.0),
-        )                                  # (B, D, L)
+            # MSQuantizer.forward requires m_lens. With fixed-length training clips no padding
+            # is needed, so all L cells are valid.
+            if m_lens is None:
+                m_lens_q = torch.full((B,), L, dtype=torch.long, device=x.device)
+            else:
+                # m_lens at the input resolution -> bottleneck cell count.
+                m_lens_q = (m_lens // (2 ** self.opt.n_layers)) * J_b
+                m_lens_q = m_lens_q.clamp(min=1, max=L).long()
 
-        # Reshape back to (B, T_b, J_b, D) so the decoder sees the structured grid.
-        z_q_per_joint = z_q.transpose(1, 2).reshape(B, T_b, J_b, D).contiguous()
+            z_q, q_loss, q_diag = self.quantizer(
+                z_1d,
+                temperature=0.5,
+                m_lens=m_lens_q,
+                start_drop=getattr(self.opt, "start_drop", -1),
+                quantize_dropout_prob=getattr(self.opt, "quantize_dropout_prob", 0.0),
+            )                                  # (B, D, L)
+
+            # Reshape back to (B, T_b, J_b, D) so the decoder sees the structured grid.
+            z_q_per_joint = z_q.transpose(1, 2).reshape(B, T_b, J_b, D).contiguous()
 
         if self.quantizer_type == "msvq":
             # q_loss is unweighted commit loss; q_diag is perplexity.

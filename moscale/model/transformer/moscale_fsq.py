@@ -163,6 +163,94 @@ def precompute_rope1d_for_batch(
     return rope_batch, offsets, total_lens
 
 
+@torch.no_grad()
+def precompute_rope2d_for_batch(
+    dim: int,                            # head_dim
+    scale_shapes,                        # iterable of (T_s, J_s) pairs, one per scale
+    max_t: int,                          # canonical T (finest scale's T), e.g. 49
+    max_j: int,                          # canonical J (finest scale's J), e.g. 7
+    base: float = 10000.0,
+    device=None,
+    scaling_factor: float = 1.0,
+):
+    """Build 2D RoPE for a sequence formed by concatenating per-scale flat
+    rasterizations of (T_s × J_s) grids.
+
+    Inside each scale, position k in [0, T_s*J_s) decodes to
+    ``(t_local, j) = divmod(k, J_s)``. We then scale-normalize the temporal axis
+    so each scale's t maps to the canonical ``max_t`` range:
+        ``t_canon = round(t_local * max_t / T_s)``.
+    The skeletal axis j is *not* scale-normalized — J_s = J across all scales
+    in the Option-A scheme, so ``j_canon = j``.
+
+    The per-position rotation channels (``dim/2`` of them in standard RoPE) are
+    split: the first ``dim/4`` rotate with t_canon, the second ``dim/4`` with
+    j_canon. Output tensor shape matches ``precompute_rope1d_for_batch``'s
+    ``(N=1, 2, 1, 1, 1, L_pad, dim//2)`` so the attention block consumes it
+    unchanged.
+
+    Args:
+        dim: per-head dimension (must be divisible by 4).
+        scale_shapes: list/tuple of (T_s, J_s) pairs.
+        max_t, max_j: canonical grid extents (typically the finest scale's).
+        base, scaling_factor: standard RoPE knobs.
+        device: torch device for the returned tensors.
+
+    Returns:
+        rope_batch    : (1, 2, 1, 1, 1, L_total, dim//2)
+        level_offsets : (1, S) cumulative starts within the concat sequence
+        total_lens    : (1,)
+    """
+    assert dim % 4 == 0, "RoPE2D requires head_dim divisible by 4 (split half ⇒ t + j)"
+    half = dim // 2
+    qtr = half // 2          # channels per axis
+
+    # --- t-axis master: cos/sin on canonical [0..max_t-1] ---
+    inv_idx_t = torch.arange(0, qtr, 2, dtype=torch.float32, device=device) / qtr
+    inv_freq_t = 1.0 / (base ** inv_idx_t)                        # (qtr/2,)
+    t_line = torch.arange(max_t, dtype=torch.float32, device=device) / scaling_factor  # (max_t,)
+    freqs_t = torch.outer(t_line, inv_freq_t)                     # (max_t, qtr/2)
+    freqs_t = torch.repeat_interleave(freqs_t, 2, dim=-1)         # (max_t, qtr)
+    master_t = torch.stack([torch.cos(freqs_t), torch.sin(freqs_t)], dim=0)  # (2, max_t, qtr)
+
+    # --- j-axis master: cos/sin on [0..max_j-1] ---
+    inv_idx_j = torch.arange(0, qtr, 2, dtype=torch.float32, device=device) / qtr
+    inv_freq_j = 1.0 / (base ** inv_idx_j)
+    j_line = torch.arange(max_j, dtype=torch.float32, device=device) / scaling_factor
+    freqs_j = torch.outer(j_line, inv_freq_j)
+    freqs_j = torch.repeat_interleave(freqs_j, 2, dim=-1)
+    master_j = torch.stack([torch.cos(freqs_j), torch.sin(freqs_j)], dim=0)  # (2, max_j, qtr)
+
+    # --- Build the concat sequence's per-position (t_canon, j_canon) coords ---
+    S = len(scale_shapes)
+    offsets = torch.zeros((1, S), device=device, dtype=torch.long)
+    segs = []
+    start = 0
+    for si, (T_s, J_s) in enumerate(scale_shapes):
+        offsets[0, si] = start
+        L_s = T_s * J_s
+        # Row-major rasterization: position k = t_local * J_s + j.
+        k = torch.arange(L_s, device=device)
+        t_local = k // J_s                                        # (L_s,)
+        j_idx = k % J_s                                            # (L_s,)
+        # Scale-normalize t to canonical max_t. (j_canon = j_idx since J_s == max_j.)
+        t_canon = torch.round(
+            t_local.to(torch.float32) * (max_t / float(T_s))
+        ).clamp_(0, max_t - 1).to(torch.long)
+        j_canon = j_idx.clamp_(0, max_j - 1).to(torch.long)
+        t_seg = master_t[:, t_canon, :]                            # (2, L_s, qtr)
+        j_seg = master_j[:, j_canon, :]                            # (2, L_s, qtr)
+        seg = torch.cat([t_seg, j_seg], dim=-1)                    # (2, L_s, half)
+        segs.append(seg)
+        start += L_s
+    cat = torch.cat(segs, dim=1) if segs else master_t.new_zeros((2, 0, half))
+    total_lens = torch.tensor([start], device=device, dtype=torch.long)
+
+    rope_batch = master_t.new_zeros((1, 2, 1, 1, 1, start, half))
+    rope_batch[0, :, 0, 0, 0, :, :] = cat
+    return rope_batch, offsets, total_lens
+
+
 ############# Mask needed helpers
 def cosine_schedule(t):
     return torch.cos(t * math.pi * 0.5)
@@ -215,7 +303,26 @@ class MoScaleFSQ(nn.Module):
         self.device = device
         self.full_length = full_length
         self.scales = scales
-        self.patch_sizes = [int(full_length // scale) for scale in self.scales]
+
+        # 2D / RoPE2D toggle (ScaleMoGen-style skeletal-temporal token map).
+        # When True, per-scale token maps are interpreted as (T_s × J) grids and
+        # the residual cascade uses 2D interpolation; the AR transformer's
+        # positional encoding switches to RoPE2D.  Pair with a 2D-trained FSQ
+        # tokenizer (--quantizer_cascade 2d).
+        self.use_rope2d = cfg.model.get('use_rope2d', False)
+        if self.use_rope2d:
+            # Option A: J preserved across scales. Derive T_b from full_length / J.
+            self.full_J = cfg.model.get('rope2d_J', 7)
+            assert full_length % self.full_J == 0, (
+                f"full_length={full_length} must be divisible by J={self.full_J} in RoPE2D mode"
+            )
+            self.full_T = full_length // self.full_J
+            self.patch_sizes_2d = [(max(1, self.full_T // s), self.full_J) for s in self.scales]
+            self.patch_sizes = [t * j for (t, j) in self.patch_sizes_2d]
+            print(f'[MoScaleFSQ] use_rope2d=True; full_(T,J)=({self.full_T},{self.full_J}); patch_sizes_2d={self.patch_sizes_2d}')
+        else:
+            self.patch_sizes = [int(full_length // scale) for scale in self.scales]
+            self.patch_sizes_2d = None
         self.L = sum(self.patch_sizes)
         self.first_l = self.patch_sizes[0]
         self.cond_drop_prob = cond_drop_prob
@@ -442,7 +549,17 @@ class MoScaleFSQ(nn.Module):
         self.mask_use_rope = True
         self.lvl_embed = nn.Embedding(len(self.patch_sizes), self.head_latent_dim)
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
-        self.rope_base, self.rope_offsets, self.rope_total_lens = precompute_rope1d_for_batch(self.head_latent_dim//num_heads, torch.tensor([self.patch_sizes]), max_length=self.patch_sizes[-1], device=self.device)
+        head_dim = self.head_latent_dim // num_heads
+        if self.use_rope2d:
+            self.rope_base, self.rope_offsets, self.rope_total_lens = precompute_rope2d_for_batch(
+                head_dim, self.patch_sizes_2d,
+                max_t=self.full_T, max_j=self.full_J, device=self.device,
+            )
+        else:
+            self.rope_base, self.rope_offsets, self.rope_total_lens = precompute_rope1d_for_batch(
+                head_dim, torch.tensor([self.patch_sizes]),
+                max_length=self.patch_sizes[-1], device=self.device,
+            )
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.head_latent_dim))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
 
@@ -454,9 +571,31 @@ class MoScaleFSQ(nn.Module):
         return self.head(self.head_nm(h.float(), cond_BD).float()).float()
     
     def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor, non_pad_mask, vq_model) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
+        current_mask = non_pad_mask[si].unsqueeze(-1).permute(0, 2, 1)  # (B, 1, L_s)
+        h_BChw = h_BChw * current_mask.float()  # (B, D, L_s)
+
+        if self.use_rope2d:
+            # f_hat is carried as (B, D, T_b, J_b). h_BChw arrives flat (B, D, T_s*J).
+            B, D, L_s = h_BChw.shape
+            T_s, J_s = self.patch_sizes_2d[si]
+            assert L_s == T_s * J_s, f"L_s={L_s} != T_s*J_s={T_s*J_s} at scale {si}"
+            h_2d = h_BChw.reshape(B, D, T_s, J_s)
+            T_full, J_full = self.full_T, self.full_J
+            if (T_s, J_s) != (T_full, J_full):
+                h_up = F.interpolate(h_2d, size=(T_full, J_full), mode='bilinear', align_corners=False)
+            else:
+                h_up = h_2d
+            h_up = vq_model.quantizer.quant_resi[si / (SN - 1)](h_up)
+            f_hat.add_(h_up)
+            if si != SN - 1:
+                T_next, J_next = self.patch_sizes_2d[si + 1]
+                nxt = F.interpolate(f_hat, size=(T_next, J_next), mode='area')
+                return f_hat, nxt.reshape(B, D, T_next * J_next)
+            else:
+                return f_hat, f_hat.reshape(B, D, T_full * J_full)
+
+        # 1D legacy path.
         feat_seq_len = self.patch_sizes[-1]
-        current_mask = non_pad_mask[si].unsqueeze(-1).permute(0, 2, 1)  # (B, L, 1)
-        h_BChw = h_BChw * current_mask.float()  # B, Cvae(512), L
         if si != SN-1:
             h = vq_model.quantizer.quant_resi[si/(SN-1)](F.interpolate(h_BChw, size=feat_seq_len, mode='linear'))     # conv after upsample
             f_hat.add_(h)
@@ -504,8 +643,15 @@ class MoScaleFSQ(nn.Module):
 
         downsampled_feature_list = []
         for i in range(len(self.patch_sizes) - 1):
-            next_size = self.patch_sizes[i + 1]
-            downsampled_feature_list.append(F.interpolate(raw_features[i], size=next_size, mode='area'))
+            if self.use_rope2d:
+                # raw_features[i]: (B, D, T_b, J_b). Downsample to (T_{i+1}, J) and flatten.
+                T_next, J_next = self.patch_sizes_2d[i + 1]
+                ds_2d = F.interpolate(raw_features[i], size=(T_next, J_next), mode='area')
+                ds = ds_2d.reshape(ds_2d.shape[0], ds_2d.shape[1], T_next * J_next)
+                downsampled_feature_list.append(ds)
+            else:
+                next_size = self.patch_sizes[i + 1]
+                downsampled_feature_list.append(F.interpolate(raw_features[i], size=next_size, mode='area'))
         x_BLC_wo_prefix = torch.cat(downsampled_feature_list, dim=2)
 
         return labels, x_BLC_wo_prefix.permute(0, 2, 1), torch.cat(non_pad_mask, dim=1), raw_features
@@ -667,10 +813,15 @@ class MoScaleFSQ(nn.Module):
         # itself does in eval_t2m.py.
         B_local = m_lens.shape[0] if hasattr(m_lens, "shape") else len(m_lens)
         device = m_lens.device if hasattr(m_lens, "device") else self.device
+        # In 2D mode patch_sizes = [T_s*J for ...], so `full_length // scale`
+        # diverges from the actual per-scale token count (e.g. 343//4=85 vs 84
+        # for T_s=12, J=7). Always use self.patch_sizes[i] as the source of
+        # truth for the per-scale token count — that's what the cascade and
+        # AR layout were built against.
         non_pad_mask = [
-            torch.ones(B_local, int(self.full_length // scale),
+            torch.ones(B_local, self.patch_sizes[i],
                        dtype=torch.bool, device=device)
-            for scale in self.scales
+            for i in range(len(self.scales))
         ]
         non_pad_mask_stack = torch.cat(non_pad_mask, dim=1).repeat(2, 1)  # [2*B, L]
 
@@ -719,7 +870,10 @@ class MoScaleFSQ(nn.Module):
         cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32
 
         feat_seq_len = self.patch_sizes[-1]; num_stages_minus_1 = len(self.patch_sizes) - 1
-        f_hat = cond_BD.new_zeros(B, self.code_dim, feat_seq_len)
+        if self.use_rope2d:
+            f_hat = cond_BD.new_zeros(B, self.code_dim, self.full_T, self.full_J)
+        else:
+            f_hat = cond_BD.new_zeros(B, self.code_dim, feat_seq_len)
         return_list = []
 
         ######################## Per-scale inference with block-causal self-attn ########################

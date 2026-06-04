@@ -50,6 +50,16 @@ def arg_parse(is_train=False):
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--use_lvl_embed", action="store_true", default=True)
+    p.add_argument("--use_rope2d", action="store_true", default=False,
+                   help="Use 2D RoPE over the (temporal × skeletal) per-scale grid instead of "
+                        "1D RoPE over the flattened sequence. Pair with a 2D-trained FSQ "
+                        "tokenizer (--quantizer_cascade 2d on the SkelVQ side). When True, "
+                        "per-scale token maps are (T_s, J=7) and the residual cascade uses "
+                        "2D area/bilinear interp. ScaleMoGen (arxiv 2605.11704) showed this "
+                        "improves text-to-motion quality vs 1D-flattened baselines.")
+    p.add_argument("--rope2d_J", type=int, default=7,
+                   help="J dimension (skeletal segments after STPool) for RoPE2D. Default 7 "
+                        "matches the SALAD encoder's J_b. Only used when --use_rope2d.")
 
     # text conditioning + classifier-free guidance
     p.add_argument("--text_cond", action="store_true", default=True,

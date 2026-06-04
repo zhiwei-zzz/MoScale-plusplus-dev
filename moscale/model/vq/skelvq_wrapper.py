@@ -129,6 +129,7 @@ _DEFAULT_OPT = dict(
     fsq_inv_temperature=20.0,
     fsq_entropy_weight=0.0,
     fsq_zeta=1.0,
+    quantizer_cascade="1d",     # "2d" to load a 2D-trained tokenizer (ScaleMoGen-style).
     scales=[8, 4, 2, 1],
     start_drop=-1,
     quantize_dropout_prob=0.0,
@@ -150,6 +151,32 @@ def _build_skelvq_opt(overrides: Optional[dict] = None) -> types.SimpleNamespace
     if overrides:
         o.update(overrides)
     return types.SimpleNamespace(**o)
+
+
+def _detect_cascade_from_opt_txt(ckpt_path: str) -> Optional[str]:
+    """Find the sibling opt.txt that SALAD writes alongside the ckpt and parse
+    `quantizer_cascade`. Returns ``"1d"``, ``"2d"``, or None if the file or
+    field is missing (legacy ckpts without this knob → treat as 1D upstream).
+
+    SALAD's layout: ``<save_root>/model/net_best_fid.tar`` and
+    ``<save_root>/opt.txt``. ckpt_path can also be other tarballs in the same
+    model/ directory.
+    """
+    try:
+        model_dir = os.path.dirname(os.path.abspath(ckpt_path))
+        save_root = os.path.dirname(model_dir)
+        opt_path = os.path.join(save_root, "opt.txt")
+        if not os.path.exists(opt_path):
+            return None
+        with open(opt_path) as f:
+            for line in f:
+                if line.startswith("quantizer_cascade:"):
+                    v = line.split(":", 1)[1].strip()
+                    if v in ("1d", "2d"):
+                        return v
+    except Exception:
+        pass
+    return None
 
 
 class _MultiScaleFSQAlias(nn.Module):
@@ -238,7 +265,15 @@ class SkelVQWrapper(nn.Module):
         super().__init__()
         SkelVQ, MultiScaleFSQ = _import_skelvq_with_isolated_utils()
 
-        self.opt = _build_skelvq_opt(opt_overrides)
+        # Auto-detect quantizer_cascade from the sibling opt.txt so callers
+        # never have to thread the flag through. Falls back to the default if
+        # opt.txt is missing or doesn't declare the field (legacy 1D ckpts).
+        detected = _detect_cascade_from_opt_txt(ckpt_path)
+        overrides = dict(opt_overrides or {})
+        if detected is not None and "quantizer_cascade" not in overrides:
+            overrides["quantizer_cascade"] = detected
+
+        self.opt = _build_skelvq_opt(overrides)
         self.opt.device = torch.device(device)
         self.opt.gpu_id = 0 if device.startswith("cuda") else -1
         self.opt.is_train = False
@@ -262,6 +297,10 @@ class SkelVQWrapper(nn.Module):
         self.effective_levels = skelvq.quantizer.effective_levels
         self.scales = list(skelvq.quantizer.scales)
         self.n_layers = self.opt.n_layers       # 2 for SkelVQ default
+        # Detect cascade mode from the loaded quantizer. "2d" tokenizers must
+        # be paired with an AR that has use_rope2d=True; the wrapper exposes
+        # this via .cascade_mode so the AR can sanity-check at construction.
+        self.cascade_mode = getattr(skelvq.quantizer, "cascade_mode", "1d")
         # Time-only downsample factor (matches HRVQVAE.down_t semantics, but
         # MoScale should call compute_bottleneck_lens for the full L = T_b * J_b
         # conversion since J_b is not a power-of-2 factor).
@@ -287,6 +326,19 @@ class SkelVQWrapper(nn.Module):
         B, T_b, J_b, D = h.shape
         z_1d = h.reshape(B, T_b * J_b, D).transpose(1, 2).contiguous()  # (B, D, L)
         return z_1d, T_b, J_b
+
+    @torch.no_grad()
+    def _encode_to_grid_2d(self, motion: torch.Tensor) -> torch.Tensor:
+        """2D-cascade variant of _encode_to_grid. Returns (B, D, T_b, J_b) and
+        the (T_b, J_b) shape — no flattening since the 2D FSQ cascade consumes
+        the structured grid directly.
+        """
+        x = motion.detach().float()
+        h = self.skelvq.motion_enc(x)             # (B, T, J=22, D)
+        h = self.skelvq.conv_enc(h)               # (B, T_b, J_b, D)
+        B, T_b, J_b, D = h.shape
+        z_2d = h.permute(0, 3, 1, 2).contiguous()  # (B, D, T_b, J_b)
+        return z_2d, T_b, J_b
 
     @torch.no_grad()
     def encode(
@@ -318,6 +370,15 @@ class SkelVQWrapper(nn.Module):
             f_hat:         (B, code_dim, L)  float,   == q_cum_list[-1]
         """
         del codebook  # unused; HRVQVAE-only knob.
+        if self.cascade_mode == "2d":
+            z_2d, _T_b, _J_b = self._encode_to_grid_2d(motion)
+            idx_list, _q_per_scale, q_cum_list = self.skelvq.quantizer.encode_indices_2d(
+                z_2d, perturb_rate=perturb_rate, train=train,
+            )
+            # idx_list[s]: (B, T_s*J, D) flat — AR consumes flat. q_cum_list[s]: (B, D, T_b, J_b).
+            f_hat = q_cum_list[-1]
+            return idx_list, q_cum_list, f_hat
+
         z_1d, _T_b, _J_b = self._encode_to_grid(motion)
         idx_list, _q_per_scale, q_cum_list = self.skelvq.quantizer.encode_indices(
             z_1d, perturb_rate=perturb_rate, train=train,
@@ -362,9 +423,31 @@ class SkelVQWrapper(nn.Module):
         Returns motion of shape (B, T, pose_dim).
         """
         assert len(idx_list) == len(self.scales)
-        # Determine full L from the finest-scale entry (scale=1).
         finest = idx_list[-1]
         B, L, D = finest.shape
+
+        if self.cascade_mode == "2d":
+            # Per-scale idx_list[s]: (B, T_s*J, D) flat. Reshape to (B, D, T_s, J),
+            # bilinear-upsample to (T_b, J_b), accumulate, then 4D-decode.
+            J_b = self.J_b
+            assert L % J_b == 0, f"finest scale L={L} not divisible by J_b={J_b}"
+            T_b = L // J_b
+            z_cum_2d = torch.zeros(B, D, T_b, J_b, device=finest.device, dtype=torch.float32)
+            for idx in idx_list:
+                Bi, L_s, _ = idx.shape
+                assert L_s % J_b == 0, f"per-scale L_s={L_s} not divisible by J_b={J_b}"
+                T_s = L_s // J_b
+                q_native_flat = self.quantizer.indices_to_codes(idx).permute(0, 2, 1).contiguous()  # (B, D, L_s)
+                q_native = q_native_flat.reshape(Bi, D, T_s, J_b)
+                if (T_s, J_b) != (T_b, J_b):
+                    q_up = F.interpolate(q_native, size=(T_b, J_b), mode="bilinear", align_corners=False)
+                else:
+                    q_up = q_native
+                z_cum_2d = z_cum_2d + q_up
+            # Decode expects (B, T_b, J_b, D).
+            return self.skelvq.decode(z_cum_2d.permute(0, 2, 3, 1).contiguous())
+
+        # 1D legacy path.
         z_cum = torch.zeros(B, D, L, device=finest.device, dtype=torch.float32)
         for idx in idx_list:
             q_native = self.quantizer.indices_to_codes(idx).permute(0, 2, 1).contiguous()  # (B, D, L_s)

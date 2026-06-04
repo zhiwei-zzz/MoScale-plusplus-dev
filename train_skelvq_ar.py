@@ -131,6 +131,7 @@ def build_cfg(opt) -> OmegaConf:
             num_layers=opt.num_layers, n_heads=opt.num_heads,
             mlp_ratio=opt.mlp_ratio, dropout=opt.dropout, attn_drop_rate=0.0,
             use_crossattn=True, attn_l2_norm=False, infer_use_kvcache=False,
+            use_rope2d=opt.use_rope2d, rope2d_J=opt.rope2d_J,
         ),
         "text_embedder": dict(dim_embed=768, version=opt.t5_model),
         "data": dict(dim_pose=opt.pose_dim, max_motion_length=opt.window_size,
@@ -192,6 +193,13 @@ def main():
     print(f"loading tokenizer ckpt: {opt.tokenizer_ckpt}")
     vq_model = SkelVQWrapper(opt.tokenizer_ckpt, device=str(opt.device))
     print(f"  J_b={vq_model.J_b}  effective_levels={vq_model.effective_levels}  scales={vq_model.scales}")
+    print(f"  cascade_mode={vq_model.cascade_mode}")
+    expected_cascade = "2d" if opt.use_rope2d else "1d"
+    assert vq_model.cascade_mode == expected_cascade, (
+        f"AR --use_rope2d={opt.use_rope2d} expects tokenizer cascade_mode='{expected_cascade}', "
+        f"but loaded tokenizer at {opt.tokenizer_ckpt} reports '{vq_model.cascade_mode}'. "
+        "Train a matching tokenizer (--quantizer_cascade 2d on the SkelVQ side) or drop --use_rope2d."
+    )
 
     # ----- (optional) generation-quality evaluator bundle
     gen_eval_bundle = build_gen_eval(opt, opt.device)
